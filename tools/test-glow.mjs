@@ -100,6 +100,9 @@ trigger(3, { now: 0 });
 const st = snapshot().find((s) => s.id === 3);
 ok('默认峰值取 GLOW_DEFAULTS.peak', near(st.peak, GLOW_DEFAULTS.peak), String(st.peak));
 ok('默认长度取 GLOW_DEFAULTS.duration', near(st.duration, GLOW_DEFAULTS.duration), String(st.duration));
+// 界面默认值（src/ui/store.js）应与这里一致，否则"触发按钮"的行为和测试假设会脱节
+ok('默认长度 = 0.05 秒', near(GLOW_DEFAULTS.duration, 0.05), String(GLOW_DEFAULTS.duration));
+ok('默认峰值 = 50', near(GLOW_DEFAULTS.peak, 50), String(GLOW_DEFAULTS.peak));
 
 // 面板 step 吸附后的最小值应能被如实执行；小于一个步长的值当"持续"
 clearAll();

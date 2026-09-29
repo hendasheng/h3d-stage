@@ -166,6 +166,8 @@ async function loadModel(file) {
       maxClassId,
       /** 调试用：改发光颜色（等价于面板上改色） */
       setGlowColor: (c) => { store.glowColor.value = c; },
+      /** 调试用：改长度（秒） */
+      setGlowDuration: (d) => { store.glowDuration.value = Number(d); },
       /** 读某 class 的当前发光强度（取该 class 第一个材质） */
       emissiveOf: (id) => {
         const list = classMaterials.get(Math.round(Number(id)));
@@ -304,8 +306,8 @@ function glowActiveCount() {
   return glow.snapshot().length;
 }
 
-/** 当前模型的最大 class 编号（用于输入校验与面板范围） */
-function maxClassId() {
+/** 当前模型的最大 class 编号（模型的真实上限；无部件时为 0） */
+export function maxClassId() {
   let max = 0;
   for (const id of classMaterials.keys()) if (id > max) max = id;
   return max;

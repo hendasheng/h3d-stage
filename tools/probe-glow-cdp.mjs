@@ -116,6 +116,8 @@ try {
     ok('默认白色：三通道等值', Math.abs(white.r - white.g) < 1e-6 && Math.abs(white.g - white.b) < 1e-6, JSON.stringify(white));
 
     await evaluate(`window.__h3d.setGlowColor('#ff8800')`);
+    // 显式给足够长的长度，避免依赖默认值（默认 0.05s，衰减太快读不到）
+    await evaluate(`window.__h3d.setGlowDuration(1)`);
     await evaluate(`window.__h3d.triggerGlow(137)`);
     await sleep(120);
     const orange = await colorOf(137);
@@ -123,8 +125,8 @@ try {
       orange.r > orange.g && orange.g > orange.b,
       `r=${orange.r.toFixed(3)} g=${orange.g.toFixed(3)} b=${orange.b.toFixed(3)}`);
 
-    // 等待衰减结束（长度 0.8 → 保持 0.8 + 衰减 0.8 ≈ 1.6s，留足余量）
-    await sleep(2600);
+    // 等待衰减结束：长度设成 1s → 保持 1s + 衰减 1s ≈ 2s，留足余量（别按默认值算，这里改了长度）
+    await sleep(3200);
     const after = await colorOf(137);
     ok('长度结束后发光归零（回到黑）', lum(after) === 0, JSON.stringify(after));
   }

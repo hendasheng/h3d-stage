@@ -16,8 +16,8 @@
 /** 当前处于发光状态的 class：Map<classId, { level, peak, holdUntil, fadeUntil, duration }> */
 const active = new Map();
 
-/** 默认峰值强度与默认衰减时长（秒），可被参数覆盖 */
-export const GLOW_DEFAULTS = { peak: 2.5, duration: 0.6 };
+/** 默认峰值强度与默认衰减时长（秒）；与界面默认值保持一致（见 src/ui/store.js） */
+export const GLOW_DEFAULTS = { peak: 50, duration: 0.05 };
 
 /** 小于这个时长（秒）视为"持续"：比一帧还短，当作 0 处理，避免出现看不见的极短发光 */
 export const MIN_TIMED_DURATION = 0.001;

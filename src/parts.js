@@ -323,9 +323,8 @@ export function buildClassMaterialIndex(parts) {
  * 把一个 class 的材质设为发光。
  *
  * 关键：**把"颜色 × 强度"整体写进 emissive，emissiveIntensity 固定为 1**。
- * 若反过来（emissive = 归一化颜色、emissiveIntensity = 大数值），比如白以外的橙色
- * #ff8800 配强度 2.5，线性空间会得到 (2.5, 1.33, 0) —— R/G 通道一起溢出，
- * 经 tonemapping 后全变白，只有衰减到低强度时颜色才显出来（踩过）。
+ * 若反过来（emissive = 归一化颜色、emissiveIntensity = 大数值），比如橙 #ff8800 配强度 50，
+ * 线性空间会得到 (50, 12.3, 0) —— 通道一起溢出，色相被压成白，只有衰减到低强度才显色（踩过）。
  * 写成 emissive = color × intensity 则超过 1 的通道仍走 tonemapping 泛白，
  * 色相在中间强度区间得以保留。
  *
@@ -335,7 +334,7 @@ export function buildClassMaterialIndex(parts) {
  * @param {number} peak 峰值强度
  * @param {number|string|THREE.Color} color 发光颜色（数字 / CSS 字符串 / Color 都接受）
  */
-export function setClassGlow(index, classId, level, peak = 2.5, color = 0xffffff) {
+export function setClassGlow(index, classId, level, peak = 50, color = 0xffffff) {
   const list = index.get(Number(classId));
   if (!list) return false;
   const intensity = Math.max(0, Math.min(1, level)) * peak;

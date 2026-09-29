@@ -19,8 +19,8 @@ export const store = {
   showGrid: signal(false),        // 世界网格（GridHelper）显隐
 
   /* ---- 0.3 材质驱动：class 发光 ---- */
-  glowDuration: signal(0.8),      // 信号长度（秒）：到期后开始衰减，再经同样时长回到 0；0 = 持续
-  glowPeak: signal(2.5),          // 峰值发光强度
+  glowDuration: signal(0.05),     // 信号长度（秒）默认值：满亮保持 0.05s，再经同样时长衰减；0 = 持续
+  glowPeak: signal(50),           // 峰值发光强度默认值
   glowColor: signal('#ffffff'),   // 发光颜色
   glowActive: signal([]),         // [{ id, level }] 当前发光的 class
   glowInput: signal('0'),         // 测试窗口里手动输入的 class 编号（整数字符串）

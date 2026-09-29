@@ -114,28 +114,30 @@ ok('关掉分色后能回到中性色', byClass.parts[0].material.color.getHexSt
 
 console.log('\n=== 5b. 发光写入材质（颜色 × 强度，保色相）===');
 const glowIndex = buildClassMaterialIndex(byClass.parts);
+// 用与界面一致的默认峰值，避免默认值改动后测试失真
+const PEAK = 50;
 const gm = glowIndex.get(137)[0];
 
-setClassGlow(glowIndex, 137, 0, 2.5, '#ff8800');
+setClassGlow(glowIndex, 137, 0, PEAK, '#ff8800');
 ok('强度 0 时 emissive 为黑（等于基础材质）', gm.emissive.getHexString() === '000000', gm.emissive.getHexString());
 
 // 关键：颜色不能归一化后交给 emissiveIntensity —— 那样中间强度会全通道溢出而变白
 // 注意 three 默认开启颜色管理，emissive 存的是**线性空间**值，所以期望值也要按线性算
-setClassGlow(glowIndex, 137, 1, 2.5, '#ff8800');
+setClassGlow(glowIndex, 137, 1, PEAK, '#ff8800');
 const c137 = gm.emissive.clone();
 const linear = new THREE.Color('#ff8800');           // setStyle 内部已做 sRGB → linear
-ok('发光颜色 = 设定色 × 强度（R 通道）', Math.abs(c137.r - linear.r * 2.5) < 1e-6, `${c137.r} vs ${linear.r * 2.5}`);
-ok('发光颜色 = 设定色 × 强度（G 通道）', Math.abs(c137.g - linear.g * 2.5) < 1e-6, `${c137.g} vs ${linear.g * 2.5}`);
+ok('发光颜色 = 设定色 × 强度（R 通道）', Math.abs(c137.r - linear.r * PEAK) < 1e-6, `${c137.r} vs ${linear.r * PEAK}`);
+ok('发光颜色 = 设定色 × 强度（G 通道）', Math.abs(c137.g - linear.g * PEAK) < 1e-6, `${c137.g} vs ${linear.g * PEAK}`);
 ok('发光颜色 = 设定色 × 强度（B 通道为 0）', Math.abs(c137.b) < 1e-6, String(c137.b));
 ok('色相未被拉平：R > G > B', c137.r > c137.g && c137.g > c137.b, `${c137.r.toFixed(3)} ${c137.g.toFixed(3)} ${c137.b.toFixed(3)}`);
 ok('强度写进颜色而非 emissiveIntensity', gm.emissiveIntensity === 1, String(gm.emissiveIntensity));
 
 // 中间强度也要保色相：R 与 G 的比值应恒定，不会因强度变化而趋同
-setClassGlow(glowIndex, 137, 0.4, 2.5, '#ff8800');
+setClassGlow(glowIndex, 137, 0.4, PEAK, '#ff8800');
 const mid = gm.emissive.clone();
 ok('半强度下色相比例不变', Math.abs(mid.r / mid.g - c137.r / c137.g) < 1e-6, `${(mid.r / mid.g).toFixed(4)}`);
 
-setClassGlow(glowIndex, 137, 0, 2.5, '#ff8800');
+setClassGlow(glowIndex, 137, 0, PEAK, '#ff8800');
 ok('归零后 emissive 回到黑', gm.emissive.getHexString() === '000000');
 
 console.log('\n=== 6. 炸开位移（Houdini Exploded View 逻辑）===');

@@ -98,7 +98,8 @@ part.position.copy(base).addScaledVector(dir, factor * 0.7 * base.distanceTo(cen
 | 编号 classId | 哪个 class 发光。**整数**（小数一律归一，OSC 常以 float32 传整数） |
 | 长度 duration | 亮多久（秒），语义同 MIDI 音符长度：满亮保持 L 秒 → 再用 L 秒线性衰减（释放尾巴） |
 
-`duration = 0` / 缺省 = 持续，直到显式 `release()`。
+`duration = 0` / 缺省 = 持续，直到显式 `release()`。界面默认值：**长度 0.05 秒、峰值强度 50**
+（`src/ui/store.js` 与 `src/glow.js` 的 `GLOW_DEFAULTS` 必须一致，测试有断言锁住）。
 
 实现要点（`src/glow.js`：纯逻辑、不依赖 three，可单测）：
 
@@ -133,9 +134,13 @@ dev 却按 esbuild 默认的 `React.createElement` 编译 → 浏览器白屏 `R
 `updateExplode` 内部逻辑没问题，问题是 `tick()` 的调用条件写成 `explode > 0`，
 **归零那帧函数根本没被调用**。只测函数内部逻辑会漏掉"它到底有没有被调用"。
 
-**面板控件的范围别用"还没加载的数据"算。** class 编号滑块曾完全拖不动：
-`max` 取自 `store.parts`，而它在组件挂载时是空的 → 滑块被建成 `0..0` 的零长度范围。
-对策：先用够大的上限建控件，模型就绪后再把范围收敛到实际值（`syncParams` 里改 `classRange.max`）。
+**面板控件的范围别用"还没加载的数据"算，更别用超大兜底值。** class 编号滑块出过两次问题：
+① `max` 取自组件挂载时还是空的 `store.parts` → 滑块被建成 `0..0`，完全拖不动；
+② 为绕开①先给 `max = 100000`，结果**这个兜底值成了实际生效的上限**，能拉到 100000。
+正解：上限取**模型的真实最大 class**（`src/main.js` 导出的 `maxClassId()`），
+并且**只在模型就绪后才创建该控件**（`hasClassRange()` 为假就先不建）。
+验证方式：给输入框写 99999 看是否被钳到真实最大值——Tweakpane 不把 min/max 暴露到 DOM，
+只能这样按行为验。
 
 **Tweakpane 的 `setHex()` 吃不了 CSS 颜色字符串。** 面板的颜色值形如 `"#ff8800"`，
 `emissive.setHex("#ff8800")` 会得到 `#000NaN`（实测过）。统一改用 `new THREE.Color(v)` 解析。

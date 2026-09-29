@@ -8,6 +8,7 @@ import { Pane } from 'tweakpane';
 import { useEffect, useRef } from 'preact/hooks';
 import { store, touch } from './store.js';
 import { VERSION } from './version.js';
+import { maxClassId } from '../main.js';
 
 /* ================================================================== */
 /* 右列：Tweakpane 控制参数                                  */
@@ -62,28 +63,29 @@ function TweakpaneControls() {
     // 材质驱动：按 class 触发发光（0.3 第一步，测试窗口；接 OSC 后由信号调用同一套接口）
     const fGlow = pane.addFolder({ title: '发光（测试）', expanded: true });
 
-    // class 编号的范围必须在**模型加载后**才知道：挂载时 store.parts 还是空的，
-    // 若那时就把 max 定成 0，滑块会变成 0..0 的零长度范围而拖不动（踩过）。
-    // 做法：先给一个够大的上限，模型就绪后由 syncParams() 用实际最大 class 收敛回来。
-    const classMaxOf = () => store.parts.reduce(
-      (m, p) => Math.max(m, Number(p.object?.userData?.classId ?? -1)), 0);
-    const classRange = { min: 0, max: 100000, step: 1 };
+    // class 编号范围 = **模型的真实最大 class**（0 起算，250 块 → 0~249）。
+    // 不要用临时的超大兜底值：那会成为实际生效的上限（踩过，滑块能拉到 100000）。
+    // 上限只能在 hasClassRange() 为真时创建控件，之前先不建。
+    const hasClassRange = () => store.parts.length > 0 && maxClassId() > 0;
+    let glowInputBinding = null;
 
     const setGlowInput = (raw) => {
-      const v = Math.round(Number(raw));
+      const max = maxClassId();
+      const v = Math.min(max, Math.max(0, Math.round(Number(raw))));
       if (!Number.isFinite(v)) return;
       params.glowInput = v;
       store.glowInput.value = String(v);
     };
 
-    let glowInputBinding = null;
     const ensureGlowInputBinding = () => {
-      if (store.parts.length === 0) return;              // 模型未就绪，等 syncParams 再来
-      if (params.glowInput > classRange.max) setGlowInput(classRange.max);
-      if (glowInputBinding) return;
+      if (glowInputBinding || !hasClassRange()) return;
+      params.glowInput = Math.min(params.glowInput, maxClassId());
+      // 直接写 min/max 数字，别用 ~ 之类的符号（Tweakpane 会把它们换成别的字符）
       glowInputBinding = fGlow.addBinding(params, 'glowInput', {
-        label: 'class 编号',
-        ...classRange,
+        label: `class 编号 0-${maxClassId()}`,
+        min: 0,
+        max: maxClassId(),
+        step: 1,
       }).on('change', (ev) => {
         setGlowInput(ev.value);
         pane.refresh();
@@ -128,14 +130,9 @@ function TweakpaneControls() {
         params.glowPeak = store.glowPeak.value;
         params.glowColor = store.glowColor.value;
 
-        // 模型可能刚加载完：把 class 编号范围收敛到实际最大值，并按需补建绑定
-        const max = classMaxOf();
-        if (max > 0) {
-          classRange.max = max;
-          if (glowInputBinding) glowInputBinding.max = max;
-        }
+        // 模型可能刚加载完：此时才建 class 编号控件，并把它钳进真实范围
         ensureGlowInputBinding();
-        if (params.glowInput > classRange.max) setGlowInput(classRange.max);
+        if (glowInputBinding) setGlowInput(store.glowInput.value);
 
         pane.refresh();
       },
