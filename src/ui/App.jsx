@@ -25,6 +25,10 @@ function TweakpaneControls() {
       wireframe: store.wireframe.value,
       spin: store.spin.value,
       showGrid: store.showGrid.value,
+      glowInput: Number(store.glowInput.value) || 0,
+      glowDuration: store.glowDuration.value,
+      glowPeak: store.glowPeak.value,
+      glowColor: store.glowColor.value,
     };
 
     const pane = new Pane({ container: paneHost.current, title: '控制', expanded: true });
@@ -55,6 +59,60 @@ function TweakpaneControls() {
     fPart.addBinding(params, 'spin', { label: '自动旋转' })
       .on('change', (ev) => { store.spin.value = ev.value; });
 
+    // 材质驱动：按 class 触发发光（0.3 第一步，测试窗口；接 OSC 后由信号调用同一套接口）
+    const fGlow = pane.addFolder({ title: '发光（测试）', expanded: true });
+
+    // class 编号的范围必须在**模型加载后**才知道：挂载时 store.parts 还是空的，
+    // 若那时就把 max 定成 0，滑块会变成 0..0 的零长度范围而拖不动（踩过）。
+    // 做法：先给一个够大的上限，模型就绪后由 syncParams() 用实际最大 class 收敛回来。
+    const classMaxOf = () => store.parts.reduce(
+      (m, p) => Math.max(m, Number(p.object?.userData?.classId ?? -1)), 0);
+    const classRange = { min: 0, max: 100000, step: 1 };
+
+    const setGlowInput = (raw) => {
+      const v = Math.round(Number(raw));
+      if (!Number.isFinite(v)) return;
+      params.glowInput = v;
+      store.glowInput.value = String(v);
+    };
+
+    let glowInputBinding = null;
+    const ensureGlowInputBinding = () => {
+      if (store.parts.length === 0) return;              // 模型未就绪，等 syncParams 再来
+      if (params.glowInput > classRange.max) setGlowInput(classRange.max);
+      if (glowInputBinding) return;
+      glowInputBinding = fGlow.addBinding(params, 'glowInput', {
+        label: 'class 编号',
+        ...classRange,
+      }).on('change', (ev) => {
+        setGlowInput(ev.value);
+        pane.refresh();
+      });
+    };
+    ensureGlowInputBinding();
+    fGlow.addButton({ title: '触发' }).on('click', () => {
+      store.handlers.triggerGlow?.(params.glowInput);
+    });
+    fGlow.addButton({ title: '释放（衰减）' }).on('click', () => {
+      store.handlers.releaseGlow?.(params.glowInput);
+    });
+    fGlow.addButton({ title: '全部释放' }).on('click', () => {
+      store.handlers.releaseAllGlow?.();
+    });
+    fGlow.addButton({ title: '立即熄灭' }).on('click', () => {
+      store.handlers.clearGlow?.();
+    });
+    // 长度：step 1ms。注意 step 会把输入吸附到它的整数倍 ——
+    // 之前用 0.02，输入 0.01 会被吸到 0，而 0 的语义是"持续"，看起来就像"值变没了"。
+    // 0 = 持续；>0 即真实时长（最小可用 0.001 秒）
+    fGlow.addBinding(params, 'glowDuration', { label: '长度(秒)', min: 0, max: 5, step: 0.001 })
+      .on('change', (ev) => { store.glowDuration.value = ev.value; });
+    // 强度上限放宽到 50：HDR 下高值才有明显过曝/泛光感；步长 0.1 保持可精调
+    fGlow.addBinding(params, 'glowPeak', { label: '发光强度', min: 0, max: 50, step: 0.1 })
+      .on('change', (ev) => { store.glowPeak.value = ev.value; });
+    fGlow.addBinding(params, 'glowColor', { label: '发光颜色' })
+      .on('change', (ev) => { store.glowColor.value = ev.value; });
+
     // main.js 通过这个句柄把外部改动同步回面板显示
     store.ui = {
       refresh() { pane.refresh(); },
@@ -66,6 +124,19 @@ function TweakpaneControls() {
         params.wireframe = store.wireframe.value;
         params.spin = store.spin.value;
         params.showGrid = store.showGrid.value;
+        params.glowDuration = store.glowDuration.value;
+        params.glowPeak = store.glowPeak.value;
+        params.glowColor = store.glowColor.value;
+
+        // 模型可能刚加载完：把 class 编号范围收敛到实际最大值，并按需补建绑定
+        const max = classMaxOf();
+        if (max > 0) {
+          classRange.max = max;
+          if (glowInputBinding) glowInputBinding.max = max;
+        }
+        ensureGlowInputBinding();
+        if (params.glowInput > classRange.max) setGlowInput(classRange.max);
+
         pane.refresh();
       },
     };

@@ -11,6 +11,9 @@
 import * as THREE from 'three';
 import { buildSubGeometry } from './palette.js';
 
+/** 复用同一个 Color 实例解析发光色，避免每帧为每个 class 新建对象 */
+const tempColor = new THREE.Color();
+
 /* ------------------------------------------------------------------ */
 /* 方式一：直接遍历场景图                                                */
 /* ------------------------------------------------------------------ */
@@ -144,11 +147,19 @@ export function buildPartsFromVertexAttribute(mesh, attributeName = '_class', ma
     const center = box.getCenter(new THREE.Vector3());
     const geo = buildSubGeometry(positions, normals, indices, tris, center);
 
-    const object = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ metalness: 0.12, roughness: 0.62 }));
+    const object = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+      metalness: 0.12,
+      roughness: 0.62,
+      // 发光：基色不变，靠 emissive 叠加。默认全黑 = 就是基础材质；
+      // 触发时写入"颜色 × 强度"（见 setClassGlow 的说明）。
+      emissive: new THREE.Color(0x000000),
+      emissiveIntensity: 1,
+    }));
     object.name = `${attributeName.replace(/^_/, '')}_${String(value).padStart(3, '0')}`;
     object.position.copy(center);
     object.userData.box = box;
     object.userData.groupValue = value;
+    object.userData.classId = Number(value);
 
     parts.push({
       name: object.name,
@@ -291,8 +302,65 @@ export function setWireframe(parts, on) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 发光（0.3 材质驱动）                                                 */
+/* ------------------------------------------------------------------ */
+
+/** 建立 class → 该 class 的材质列表；触发时按 class 找材质，不需要遍历全部部件 */
+export function buildClassMaterialIndex(parts) {
+  const byClass = new Map();
+  for (const p of parts) {
+    const id = p.object?.userData?.classId;
+    if (id === undefined) continue;
+    let list = byClass.get(id);
+    if (!list) byClass.set(id, (list = []));
+    list.push(p.material);
+  }
+  return byClass;
+}
+
+/**
+ * 把一个 class 的材质设为发光。
+ *
+ * 关键：**把"颜色 × 强度"整体写进 emissive，emissiveIntensity 固定为 1**。
+ * 若反过来（emissive = 归一化颜色、emissiveIntensity = 大数值），比如白以外的橙色
+ * #ff8800 配强度 2.5，线性空间会得到 (2.5, 1.33, 0) —— R/G 通道一起溢出，
+ * 经 tonemapping 后全变白，只有衰减到低强度时颜色才显出来（踩过）。
+ * 写成 emissive = color × intensity 则超过 1 的通道仍走 tonemapping 泛白，
+ * 色相在中间强度区间得以保留。
+ *
+ * @param {Map<number, THREE.Material[]>} index 来自 buildClassMaterialIndex
+ * @param {number} classId
+ * @param {number} level 0~1（最终强度 = level × peak）
+ * @param {number} peak 峰值强度
+ * @param {number|string|THREE.Color} color 发光颜色（数字 / CSS 字符串 / Color 都接受）
+ */
+export function setClassGlow(index, classId, level, peak = 2.5, color = 0xffffff) {
+  const list = index.get(Number(classId));
+  if (!list) return false;
+  const intensity = Math.max(0, Math.min(1, level)) * peak;
+  // 用 THREE.Color 统一解析：setHex 只吃数字，面板传来的是 "#ff8800" 这种字符串，
+  // 直接喂给 setHex 会得到 NaN（曾实测到 emissive = #000NaN）。
+  const tint = tempColor.set(color);
+  for (const mat of list) {
+    if (!mat) continue;
+    if (mat.emissive) mat.emissive.copy(tint).multiplyScalar(intensity);
+    mat.emissiveIntensity = 1;
+  }
+  return true;
+}
+
+/** 清空所有发光（强度归零） */
+export function clearGlow(parts) {
+  for (const p of parts) {
+    if (!p.material) continue;
+    p.material.emissive.setRGB(0, 0, 0);
+    p.material.emissiveIntensity = 1;
+  }
+}
+
 export function resetMaterials(parts) {
-  for (const p of parts) if (p.material) p.material.emissive?.setHex(0x000000);
+  clearGlow(parts);
 }
 
 export function restoreBasePositions(parts) {

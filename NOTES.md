@@ -89,6 +89,26 @@ part.position.copy(base).addScaledVector(dir, factor * 0.7 * base.distanceTo(cen
 结果原始网格躺下，而按原始几何生成的部件没吃到这个旋转 → 两个模式姿态不一致。
 **只做居中，不改朝向。**
 
+## class 发光：信号语义（0.3 材质驱动）
+
+一条信号至少两条信息 —— **编号 + 长度**：
+
+| 字段 | 含义 |
+| --- | --- |
+| 编号 classId | 哪个 class 发光。**整数**（小数一律归一，OSC 常以 float32 传整数） |
+| 长度 duration | 亮多久（秒），语义同 MIDI 音符长度：满亮保持 L 秒 → 再用 L 秒线性衰减（释放尾巴） |
+
+`duration = 0` / 缺省 = 持续，直到显式 `release()`。
+
+实现要点（`src/glow.js`：纯逻辑、不依赖 three，可单测）：
+
+- 强度按**时间戳**计算，不按帧累加 → 掉帧不残留、不同帧率结果一致
+- 材质侧**把"颜色 × 强度"整体写进 `emissive`，`emissiveIntensity` 固定为 1**，基色不动
+  → 颜色全黑时它就是纯基础材质；所以"基础材质 / 基础+发光"两态用**同一材质**表达，不需要换材质
+- **为什么不是"归一化颜色 + 大 emissiveIntensity"**：那样 R/G 通道会一起溢出到顶，
+  经 tone mapping 后**全变白**，只有衰减到低强度才显出颜色（踩过，见下）
+- **emissive 归发光独占**：选中高亮原先也写 emissive，会互相覆盖，已改为选中只在列表/信息区体现
+
 ## 测试与构建的坑
 
 **`vite build` 通过 ≠ dev 能跑。** 缺 `@preact/preset-vite` 时，build 走 automatic runtime 能过，
@@ -112,6 +132,20 @@ dev 却按 esbuild 默认的 `React.createElement` 编译 → 浏览器白屏 `R
 **复位路径必须专门测。** 炸开滑块曾出现"拉到 0 仍有偏移且越来越大"——
 `updateExplode` 内部逻辑没问题，问题是 `tick()` 的调用条件写成 `explode > 0`，
 **归零那帧函数根本没被调用**。只测函数内部逻辑会漏掉"它到底有没有被调用"。
+
+**面板控件的范围别用"还没加载的数据"算。** class 编号滑块曾完全拖不动：
+`max` 取自 `store.parts`，而它在组件挂载时是空的 → 滑块被建成 `0..0` 的零长度范围。
+对策：先用够大的上限建控件，模型就绪后再把范围收敛到实际值（`syncParams` 里改 `classRange.max`）。
+
+**Tweakpane 的 `setHex()` 吃不了 CSS 颜色字符串。** 面板的颜色值形如 `"#ff8800"`，
+`emissive.setHex("#ff8800")` 会得到 `#000NaN`（实测过）。统一改用 `new THREE.Color(v)` 解析。
+
+**发光一定不能写成"归一化颜色 + 大 emissiveIntensity"。** 曾用
+`emissive = #ff8800`（归一化）+ `emissiveIntensity = 2.5`，线性空间实际是 `(2.5, 0.616, 0)`：
+屏幕输出只有 0~1，R 早早溢出到顶、G 在强度约 4 时才追上，中间区间两通道一起顶格
+→ 经 ACES tone mapping 后**通体变白**，只有衰减到低强度时才显出设置的颜色。
+正解：`emissive = color × intensity`、`emissiveIntensity = 1` —— 数学上等价，但**色相比例在任何强度下恒定**。
+另注意 three 默认开启颜色管理，材质里存的是**线性空间**值（`#ff8800` 的 G ≈ 0.246 而非 0.533）。
 
 ## 环境
 

@@ -17,6 +17,13 @@ export const store = {
   wireframe: signal(false),
   spin: signal(true),
   showGrid: signal(false),        // 世界网格（GridHelper）显隐
+
+  /* ---- 0.3 材质驱动：class 发光 ---- */
+  glowDuration: signal(0.8),      // 信号长度（秒）：到期后开始衰减，再经同样时长回到 0；0 = 持续
+  glowPeak: signal(2.5),          // 峰值发光强度
+  glowColor: signal('#ffffff'),   // 发光颜色
+  glowActive: signal([]),         // [{ id, level }] 当前发光的 class
+  glowInput: signal('0'),         // 测试窗口里手动输入的 class 编号（整数字符串）
   filter: signal(''),
   partsCollapsed: signal(false),
   selected: signal(-1),

@@ -23,7 +23,11 @@ import {
   applyColorMode,
   updateExplode,
   setWireframe,
+  buildClassMaterialIndex,
+  setClassGlow,
+  clearGlow,
 } from './parts.js';
+import * as glow from './glow.js';
 // 版本的唯一来源：package.json（见 src/ui/version.js），改版本只改一处
 import { VERSION } from './ui/version.js';
 
@@ -39,6 +43,7 @@ let sourceScene = null;     // 加载出来的 gltf.scene
 let modelRadius = 10;
 let classKey = '_class';    // 几何体上的分组属性名
 let classValueCount = 0;    // 该属性有多少种取值 = 有多少个碎块
+let classMaterials = new Map();   // class 编号 → 该 class 的材质列表（发光用）
 // 注意：必须在使用前声明 —— signal.subscribe() 会立刻同步触发回调，
 // 若声明写在后面会命中暂时性死区（TDZ）直接抛错。
 let lastExplode = 0;
@@ -147,6 +152,34 @@ async function loadModel(file) {
   $('modelmeta') && ($('modelmeta').textContent = `${source.generator} · ${(arrayBuffer.byteLength / 1024).toFixed(0)} KB`);
   $('modelnodes') && ($('modelnodes').textContent =
     `${source.nodeCount} node / ${source.meshCount} mesh / ${source.primitiveCount} primitive / ${source.materialCount} material`);
+
+  // 模型就绪后同步面板：class 编号的范围、以及挂载时因 parts 为空而没建起来的绑定
+  store.ui?.syncParams();
+
+  // 仅 dev：把发光接口挂到 window，供 tools/probe-glow-cdp.mjs 做真实运行时验证。
+  // import.meta.env.DEV 在生产构建里是 false，整段会被摇掉，不进产物。
+  if (import.meta.env?.DEV) {
+    window.__h3d = {
+      triggerGlow,
+      releaseGlow,
+      classCount: () => classMaterials.size,
+      maxClassId,
+      /** 调试用：改发光颜色（等价于面板上改色） */
+      setGlowColor: (c) => { store.glowColor.value = c; },
+      /** 读某 class 的当前发光强度（取该 class 第一个材质） */
+      emissiveOf: (id) => {
+        const list = classMaterials.get(Math.round(Number(id)));
+        return list?.[0]?.emissiveIntensity ?? -1;
+      },
+      /** 读某 class 当前 emissive 的线性颜色（强度已乘进颜色里） */
+      emissiveColorOf: (id) => {
+        const m = classMaterials.get(Math.round(Number(id)))?.[0];
+        if (!m) return null;
+        return { r: m.emissive.r, g: m.emissive.g, b: m.emissive.b };
+      },
+      glowActive: () => store.glowActive.value.map((e) => e.id),
+    };
+  }
 
   $('overlay').classList.add('done');
 }
@@ -257,7 +290,93 @@ function tick() {
   }
   lastExplode = store.explode.value;
 
+  // 材质驱动：每帧按时间戳算各 class 的发光强度（与帧率无关），并写进材质
+  if (glowActiveCount()) updateGlow();
+
   if (needRender) renderer.render(scene, camera);
+}
+
+/* ------------------------------------------------------------------ */
+/* 发光：手动触发（0.3 第一步，OSC 之前）                                */
+/* ------------------------------------------------------------------ */
+
+function glowActiveCount() {
+  return glow.snapshot().length;
+}
+
+/** 当前模型的最大 class 编号（用于输入校验与面板范围） */
+function maxClassId() {
+  let max = 0;
+  for (const id of classMaterials.keys()) if (id > max) max = id;
+  return max;
+}
+
+/** 触发某 class 发光。class 编号是整数：OSC / 面板传来小数也归一成整数 */
+function triggerGlow(classId) {
+  const id = Math.round(Number(classId));   // class 为整数编号，杜绝 1.5 这类值
+  if (!Number.isFinite(id)) return false;
+  if (id < 0 || id > maxClassId()) {
+    setSelection(`class 编号越界：${id}（当前模型范围 0~${maxClassId()}）`);
+    return false;
+  }
+  if (!classMaterials.has(id)) {
+    setSelection(`class ${id} 不存在（当前模型共 ${classMaterials.size} 个 class）`);
+    return false;
+  }
+  glow.trigger(id, {
+    peak: store.glowPeak.value,
+    duration: store.glowDuration.value,
+  });
+  refreshGlowStatus();
+  return true;
+}
+
+/** 释放某 class：从当前强度衰减到 0 */
+function releaseGlow(classId) {
+  glow.release(Number(classId), { duration: store.glowDuration.value });
+  refreshGlowStatus();
+}
+
+function releaseAllGlow() {
+  for (const id of glow.activeIds()) glow.release(id, { duration: store.glowDuration.value });
+  refreshGlowStatus();
+}
+
+/** 立即熄灭全部（不清材质，等下一帧 updateGlow 落零） */
+function clearAllGlow() {
+  glow.clearAll();
+  clearGlow(store.parts);
+  store.glowActive.value = [];
+  updateGlow();
+  touch();
+}
+
+/** 按当前时间把强度写进材质；导出供 tick 调用 */
+function updateGlow() {
+  const now = performance.now() / 1000;
+  const levels = glow.levelsAt(now);
+  let changed = false;
+  for (const [id, level] of levels) {
+    setClassGlow(classMaterials, id, level, store.glowPeak.value, store.glowColor.value);
+    changed = true;
+  }
+  // 熄灭的（已从 levels 里移除）：把强度归零
+  const next = [...levels.keys()].sort((a, b) => a - b);
+  const prev = store.glowActive.value.map((e) => Number(e.id));
+  for (const id of prev) if (!levels.has(id)) { setClassGlow(classMaterials, id, 0, store.glowPeak.value, store.glowColor.value); changed = true; }
+
+  if (changed || next.length !== prev.length) {
+    store.glowActive.value = next.map((id) => ({ id, level: levels.get(id) }));
+    refreshGlowStatus();
+    touch();
+  }
+}
+
+/** 把活跃清单写进标题区（用于肉眼确认哪些 class 正在发光） */
+function refreshGlowStatus() {
+  const list = store.glowActive.value;
+  if (!list.length) { setSelection(store.selected.value >= 0 ? store.info.value.selection : ''); return; }
+  setSelection('发光中：' + list.map((e) => `class ${e.id}(${(e.level ?? 1).toFixed(2)})`).join('  '));
 }
 
 /**
@@ -274,6 +393,11 @@ export function shouldUpdateExplode(explode, prevExplode) {
 
 function wireHandlers() {
   store.handlers.select = (index) => select(index);
+  // 发光测试窗口（0.3 第一步；接 OSC 后由信号直接调 triggerGlow/releaseGlow）
+  store.handlers.triggerGlow = (classId) => triggerGlow(classId);
+  store.handlers.releaseGlow = (classId) => releaseGlow(classId);
+  store.handlers.releaseAllGlow = () => releaseAllGlow();
+  store.handlers.clearGlow = () => clearAllGlow();
   store.handlers.visibility = (index, visible) => {
     const p = store.parts[index];
     if (p) { p.visible = visible; p.object.visible = visible; }
@@ -355,14 +479,19 @@ async function buildParts() {
 
   applyColors();
   setWireframe(store.parts, store.wireframe.value);
+  classMaterials = buildClassMaterialIndex(store.parts);   // class → 材质，发光时按编号直取
+  glow.clearAll();
+  store.glowActive.value = [];
   touch();
   updateDebug();
 }
 
-/** 选中一个部件：高亮 + 在标题区显示它的信息（class 分色开启时同时显示该 class 的颜色） */
+/**
+ * 选中一个部件：记录索引 + 在标题区显示它的信息。
+ * 注意：**不再用 emissive 做选中高亮** —— 材质驱动（0.3）之后 emissive 专用于 class 发光，
+ * 两处都写会互相覆盖。选中态在列表里体现，3D 里靠发光/分色区分。
+ */
 function select(index) {
-  const prev = store.selected.value;
-  if (prev >= 0 && store.parts[prev]) store.parts[prev].material.emissive?.setHex(0x000000);
   store.selected.value = index;
 
   if (index < 0 || !store.parts[index]) {
@@ -372,13 +501,14 @@ function select(index) {
   }
 
   const p = store.parts[index];
-  p.material.emissive?.setHex(0x2a5a70);
-  const groupValue = p.object.userData.groupValue;
+  const classId = p.object.userData.classId;
   const colorHex = store.classColors.value ? '#' + p.material.color.getHexString() : null;
+  const glowing = classId !== undefined && store.glowActive.value.some((e) => Number(e.id) === Number(classId));
   setSelection(
     `选中 ${p.name} · ${p.triangleCount}△` +
-    (groupValue !== undefined ? ` · class=${groupValue}` : '') +
-    (colorHex ? ` · ${colorHex}` : '')
+    (classId !== undefined ? ` · class=${classId}` : '') +
+    (colorHex ? ` · ${colorHex}` : '') +
+    (glowing ? ' · 发光中' : '')
   );
   touch();
 }
