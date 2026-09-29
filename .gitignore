@@ -1,0 +1,19 @@
+# 依赖与缓存（体积大，不入库）
+node_modules/
+.npm-cache/
+
+# 构建产物（可由源码重建）
+dist/
+
+# 本地配置
+.env
+.env.local
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+*.log
+
+# 临时文件
+*.tmp
+.*.tmpdir/

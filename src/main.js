@@ -1,0 +1,509 @@
+/**
+ * main.js —— three.js 场景 + 数据管线 + 与 UI 的接线。
+ *
+ * 界面不再手搓：左侧（标题 / 部件列表）用 Preact 组件，右侧控制项用 Tweakpane，
+ * 共享状态在 src/ui/store.js。本文件只负责 3D、模型解析和把库的回调接到数据上。
+ */
+
+import './base.css';
+import * as THREE from 'three';
+import { render, h } from 'preact';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { App } from './ui/App.jsx';
+import { store, setInfo, setDebug, setSelection, touch } from './ui/store.js';
+import { parseGLBBuffers } from './demo-glb.js';
+import { listModels, modelUrl } from './models.js';
+import { weldByPosition, connectivityBySharedVertices } from './connectivity.js';
+import { paletteColor } from './palette.js';
+import {
+  collectPartsFromScene,
+  buildPartsFromVertexAttribute,
+  applyColorMode,
+  updateExplode,
+  setWireframe,
+} from './parts.js';
+// 版本的唯一来源：package.json（见 src/ui/version.js），改版本只改一处
+import { VERSION } from './ui/version.js';
+
+const $ = (id) => document.getElementById(id);
+
+const MAX_PARTS = 2000;
+const GRID_SIZE = 40;       // 世界网格边长（同时作为格数 → 每格 1 单位）
+
+let renderer, scene, camera, controls, modelRoot, centerGroup, raycaster, worldGrid;
+let source = null;          // parseGLBBuffers 的结果
+let sourceMesh = null;      // three.js 侧的基准 Mesh
+let sourceScene = null;     // 加载出来的 gltf.scene
+let modelRadius = 10;
+let classKey = '_class';    // 几何体上的分组属性名
+let classValueCount = 0;    // 该属性有多少种取值 = 有多少个碎块
+// 注意：必须在使用前声明 —— signal.subscribe() 会立刻同步触发回调，
+// 若声明写在后面会命中暂时性死区（TDZ）直接抛错。
+let lastExplode = 0;
+// 模型就绪前忽略 UI 触发的重建，否则 subscribe 的立即回调会拿着空场景去拆部件
+let ready = false;
+
+/* ================================================================== */
+/* 引导                                                                */
+/* ================================================================== */
+
+init();
+
+/**
+ * 引导：只做一次的事（场景 / UI / 事件接线），然后加载下拉里的首个模型。
+ * 模型本身可以随时切换，见 loadModel()。
+ */
+async function init() {
+  wireHandlers();
+  initThree();
+  render(h(App, {}), $('app'));
+  initControlsWiring();
+
+  const models = listModels();
+  if (models.length === 0) {
+    fail('src/assets/models/ 下没有 .glb 文件。放一个进去再刷新。');
+    return;
+  }
+  store.models = models;
+  await loadModel(models[0]);
+}
+
+/**
+ * 加载并显示指定模型（换模型就是重新跑一遍它）。
+ * 失败时把错误显示在遮罩上，不影响已加载的模型。
+ * @param {string} file src/assets/models/ 下的文件名
+ */
+async function loadModel(file) {
+  ready = false;                       // 重建期间挂起 UI 触发的重建
+  $('overlay').classList.remove('done');
+
+  let result;
+  try {
+    result = await fetchModel(file);
+  } catch (err) {
+    fail(`无法加载模型：${err.message}\n当前模型：${file}\n请确认 src/assets/models/ 下确实有这个文件。`);
+    return;
+  }
+
+  const { arrayBuffer, parsed, gltf } = result;
+  teardownScene();
+
+  source = parsed;
+  sourceScene = gltf.scene;
+
+  // 只做居中，不改朝向：glTF 已是 Y-up，加载后就是站立姿态
+  const box = new THREE.Box3().setFromObject(sourceScene);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  modelRadius = Math.max(size.length() * 0.5, 1);
+  sourceScene.position.sub(center);
+
+  modelRoot = new THREE.Group();
+  modelRoot.add(sourceScene);
+  scene.add(modelRoot);
+
+  const baseMeshes = [];
+  sourceScene.traverse((o) => { if (o.isMesh) baseMeshes.push(o); });
+  sourceMesh = baseMeshes[0] ?? null;
+  if (!sourceMesh) {
+    fail(`${file} 里没有任何 Mesh。`);
+    return;
+  }
+
+  // 找出几何体上的分组属性（Houdini 的 class 会导出成 _class）
+  classKey = null;
+  for (const name of Object.keys(sourceMesh.geometry.attributes)) {
+    if (name.startsWith('_')) { classKey = name; break; }
+  }
+  classValueCount = 0;
+  if (classKey) {
+    const values = new Set();
+    const arr = sourceMesh.geometry.attributes[classKey].array;
+    for (let i = 0; i < arr.length; i++) values.add(Number(arr[i]));
+    classValueCount = values.size;
+  }
+
+  controls.target.set(0, 0, 0);
+  camera.position.set(modelRadius * 1.5, modelRadius * 0.85, modelRadius * 1.7);
+  controls.update();
+
+  await buildParts();
+  ready = true;   // 之后 UI 的改动才允许触发重建
+
+  renderStats();
+  renderDiagnostics();
+
+  setInfo({
+    model: file,
+    summary: classKey
+      ? `${classValueCount} 个碎块 · ${(source.indices.length / 3).toLocaleString()} 三角形`
+      : `${source.nodeCount} 节点 · ${source.meshCount} 网格 · 未找到分组属性`,
+    path: `src/assets/models/${file}`,
+    debug: '',
+  });
+  $('modelpath') && ($('modelpath').textContent = `src/assets/models/${file}`);
+  $('modelmeta') && ($('modelmeta').textContent = `${source.generator} · ${(arrayBuffer.byteLength / 1024).toFixed(0)} KB`);
+  $('modelnodes') && ($('modelnodes').textContent =
+    `${source.nodeCount} node / ${source.meshCount} mesh / ${source.primitiveCount} primitive / ${source.materialCount} material`);
+
+  $('overlay').classList.add('done');
+}
+
+/** 取回并解析模型文件；不碰场景，便于在切换时先确认新模型可用 */
+async function fetchModel(file) {
+  const res = await fetch(modelUrl(file));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  // dev server 对不存在的路径会返回 index.html（状态仍是 200），所以必须看 Content-Type，
+  // 否则后面会把 HTML 当 GLB 解析，报出一句看不出真因的错。
+  const type = res.headers.get('content-type') ?? '';
+  if (!/octet-stream|gltf|binary|model/i.test(type)) {
+    throw new Error(`服务器返回的是 ${type || '未知类型'}，不是模型文件——多半是路径写错了`);
+  }
+  const arrayBuffer = await res.arrayBuffer();
+  const parsed = parseGLBBuffers(arrayBuffer);              // 二进制层面
+  const gltf = await new GLTFLoader().parseAsync(arrayBuffer, '');  // 渲染层面
+  return { arrayBuffer, parsed, gltf };
+}
+
+/** 移除并释放上一个模型占用的资源（几何体 / 材质 / 场景对象） */
+function teardownScene() {
+  clearParts();
+  if (modelRoot) {
+    scene.remove(modelRoot);
+    modelRoot.traverse((o) => {
+      if (!o.isMesh) return;
+      o.geometry?.dispose?.();
+      if (Array.isArray(o.material)) o.material.forEach((m) => m?.dispose?.());
+      else o.material?.dispose?.();
+    });
+    modelRoot = null;
+  }
+  source = null;
+  sourceMesh = null;
+  sourceScene = null;
+  classKey = null;
+  classValueCount = 0;
+}
+
+function fail(msg) {
+  const ov = $('overlay');
+  ov.classList.remove('done');
+  ov.innerHTML = `<div style="max-width:640px;color:#ef5350;white-space:pre-wrap;font-family:Consolas,monospace;font-size:12px;text-align:left">${escapeHtml(msg)}</div>`;
+  setDebug('ERROR');
+}
+
+/* ================================================================== */
+/* three.js 基础场景                                                    */
+/* ================================================================== */
+
+function initThree() {
+  renderer = new THREE.WebGLRenderer({ canvas: $('view'), antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0d1014);
+  scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+
+  camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.05, 4000);
+  camera.position.set(14, 9, 16);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.07;
+
+  scene.add(new THREE.HemisphereLight(0xa8c4ff, 0x14171c, 1.1));
+  const key = new THREE.DirectionalLight(0xffffff, 1.9);
+  key.position.set(9, 16, 11);
+  scene.add(key);
+  const fill = new THREE.DirectionalLight(0x88aaff, 0.7);
+  fill.position.set(-11, 6, -9);
+  scene.add(fill);
+
+  centerGroup = new THREE.Group();
+  scene.add(centerGroup);
+
+  // 世界网格：three 自带的 GridHelper，放在世界原点（0,0,0）的 XZ 平面上，
+  // 挂在场景根节点（不随模型自转），作为空间参照
+  worldGrid = new THREE.GridHelper(GRID_SIZE, GRID_SIZE, 0x4a5568, 0x2a323d);
+  worldGrid.visible = store.showGrid.value;
+  scene.add(worldGrid);
+
+  raycaster = new THREE.Raycaster();
+
+  window.addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+  renderer.domElement.addEventListener('pointerdown', onPointerDown);
+  renderer.domElement.addEventListener('pointermove', onPointerMove);
+  renderer.setAnimationLoop(tick);
+}
+
+function tick() {
+  if (store.spin.value && modelRoot) modelRoot.rotation.y += 0.0025;
+  controls.update();
+  let needRender = true;
+
+  // 只要曾经炸开过就继续调用 —— 包括 factor 归零那一帧，
+  // 因为"复位"是由 updateExplode 内部 factor <= 0 的分支完成的。
+  if (shouldUpdateExplode(store.explode.value, lastExplode) && store.parts.length) {
+    updateExplode(store.parts, store.explode.value, modelRadius);
+  }
+  lastExplode = store.explode.value;
+
+  if (needRender) renderer.render(scene, camera);
+}
+
+/**
+ * 是否需要在这一帧更新炸开位置。
+ * 关键：factor 从 >0 变成 0 的那一帧也必须返回 true。
+ */
+export function shouldUpdateExplode(explode, prevExplode) {
+  return explode > 0 || prevExplode > 0;
+}
+
+/* ================================================================== */
+/* 把界面事件接到数据上（库 → 数据 的唯一入口）                           */
+/* ================================================================== */
+
+function wireHandlers() {
+  store.handlers.select = (index) => select(index);
+  store.handlers.visibility = (index, visible) => {
+    const p = store.parts[index];
+    if (p) { p.visible = visible; p.object.visible = visible; }
+  };
+}
+
+/** 按当前设置给所有部件上色（基础材质中性色 / class 分色） */
+function applyColors() {
+  applyColorMode(store.parts, store.classColors.value, paletteColor, store.baseColor.value);
+}
+
+function initControlsWiring() {
+  // subscribe 的回调会立即同步执行一次；模型没加载完之前不要真的重建
+  store.model.subscribe((file) => {
+    if (file && file !== store.info.value.model) void loadModel(file);
+  });
+  store.explode.subscribe(() => {
+    if (store.ui) store.ui.syncParams();
+  });
+  store.classColors.subscribe(() => {
+    if (ready) { applyColors(); touch(); }
+    if (store.ui) store.ui.syncParams();
+  });
+  store.baseColor.subscribe(() => {
+    if (ready && !store.classColors.value) { applyColors(); touch(); }
+    if (store.ui) store.ui.syncParams();
+  });
+  store.wireframe.subscribe((on) => {
+    if (ready) setWireframe(store.parts, on);
+    if (store.ui) store.ui.syncParams();
+  });
+  store.showGrid.subscribe((on) => {
+    if (worldGrid) worldGrid.visible = on;
+    if (store.ui) store.ui.syncParams();
+  });
+}
+
+/* ================================================================== */
+/* 部件：构建 / 选择 / 高亮                                             */
+/* ================================================================== */
+
+function clearParts() {
+  for (const p of store.parts) {
+    p.object.parent?.remove(p.object);
+    if (p.source !== 'node') {
+      p.geometry.dispose?.();
+      p.object.material?.dispose?.();
+    }
+  }
+  store.parts = [];
+  store.selected.value = -1;
+  centerGroup.clear();
+}
+
+/** 按顶点分组属性（Houdini 的 class）把当前模型拆成部件 */
+async function buildParts() {
+  store.explode.value = 0;
+  lastExplode = 0;
+  clearParts();
+
+  if (classKey) {
+    store.parts = buildPartsFromVertexAttribute(sourceMesh, classKey, MAX_PARTS).parts;
+  } else {
+    // 没有分组属性时退回"整个网格就是一个部件"
+    store.parts = collectPartsFromScene(sourceScene).parts;
+  }
+
+  // 静止位置只在这里写一次；updateExplode 只读不写（否则每帧累加会漂移）
+  for (let i = 0; i < store.parts.length; i++) {
+    const p = store.parts[i];
+    p.object.userData.basePosition = p.object.position.clone();
+    p.object.userData.partIndex = i;
+  }
+
+  // 部件都是按原始几何单独生成的，所以原始网格始终隐藏
+  sourceScene.visible = false;
+  sourceScene.rotation.set(0, 0, 0);
+  for (const p of store.parts) centerGroup.add(p.object);
+
+  applyColors();
+  setWireframe(store.parts, store.wireframe.value);
+  touch();
+  updateDebug();
+}
+
+/** 选中一个部件：高亮 + 在标题区显示它的信息（class 分色开启时同时显示该 class 的颜色） */
+function select(index) {
+  const prev = store.selected.value;
+  if (prev >= 0 && store.parts[prev]) store.parts[prev].material.emissive?.setHex(0x000000);
+  store.selected.value = index;
+
+  if (index < 0 || !store.parts[index]) {
+    setSelection('');
+    touch();
+    return;
+  }
+
+  const p = store.parts[index];
+  p.material.emissive?.setHex(0x2a5a70);
+  const groupValue = p.object.userData.groupValue;
+  const colorHex = store.classColors.value ? '#' + p.material.color.getHexString() : null;
+  setSelection(
+    `选中 ${p.name} · ${p.triangleCount}△` +
+    (groupValue !== undefined ? ` · class=${groupValue}` : '') +
+    (colorHex ? ` · ${colorHex}` : '')
+  );
+  touch();
+}
+
+function pickPart(ev) {
+  if (!store.parts.length) return -1;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const ndc = new THREE.Vector2(
+    ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+    -((ev.clientY - rect.top) / rect.height) * 2 + 1
+  );
+  raycaster.setFromCamera(ndc, camera);
+  const targets = store.parts.filter((p) => p.visible).map((p) => p.object);
+  const hits = raycaster.intersectObjects(targets, false);
+  return hits.length ? (hits[0].object.userData.partIndex ?? -1) : -1;
+}
+
+let lastMove = 0;
+function onPointerMove(ev) {
+  const now = performance.now();
+  if (now - lastMove < 60) return;
+  lastMove = now;
+  void ev;
+}
+
+function onPointerDown(ev) {
+  const i = pickPart(ev);
+  if (i >= 0) select(i);
+}
+
+/* ================================================================== */
+/* 右侧面板里的「模型 / 数据 / 诊断」文本块（由本文件写 DOM）              */
+/* ================================================================== */
+
+function updateDebug(msg) {
+  const tris = store.parts.reduce((s, p) => s + p.triangleCount, 0);
+  setDebug(`parts=${store.parts.length}  tris=${tris}` +
+    `  ${classKey ?? 'no-class'}=${classKey ? classValueCount : '-'}${msg ? '  ' + msg : ''}`);
+}
+
+function renderStats() {
+  const host = $('statsBody');
+  if (!host || !source) return;
+  const tris = store.parts.reduce((s, p) => s + p.triangleCount, 0);
+  const verts = store.parts.reduce((s, p) => s + p.vertexCount, 0);
+  const rows = [
+    ['模型文件', store.info.value.model || '—'],
+    ['部件数量 (可 for 循环)', store.parts.length],
+    ['三角形总数', tris],
+    ['顶点总数', verts],
+    ['primitive / material', `${source.primitiveCount} / ${source.materialCount}`],
+    ['属性通道', source.attributeKeys.join(', ')],
+    ['分组属性', classKey ? `${classKey}（${classValueCount} 组）` : '无'],
+    ['three.js 属性', Object.keys(sourceMesh.geometry.attributes).join(', ')],
+  ];
+  host.innerHTML = rows
+    .map(([k, v]) => `<div class="stat"><span class="k">${escapeHtml(k)}</span><span class="v">${escapeHtml(String(v))}</span></div>`)
+    .join('');
+}
+
+function renderDiagnostics() {
+  const host = $('diagBody');
+  if (!host || !source) return;
+
+  const positions = source.positions;
+  const indices = source.indices;
+  const triCount = indices.length / 3;
+
+  const { count: weldedCount } = weldByPosition(positions);
+  const conn = connectivityBySharedVertices(indices, positions.length / 3);
+  const perGroup = new Map();
+  for (let t = 0; t < triCount; t++) perGroup.set(conn.triGroup[t], (perGroup.get(conn.triGroup[t]) ?? 0) + 1);
+  const connSizes = [...perGroup.values()].sort((a, b) => b - a);
+
+  const multiNode = source.nodeCount > 1 && source.meshCount > 1;
+  const hasGroups = (sourceMesh?.geometry.groups?.length ?? 0) > 0;
+  const hasClass = !!classKey;
+
+  let classTriStat = '';
+  if (hasClass) {
+    const arr = sourceMesh.geometry.attributes[classKey].array;
+    const perValue = new Map();
+    for (let t = 0; t < triCount; t++) {
+      const v = Number(arr[indices[t * 3]]);
+      perValue.set(v, (perValue.get(v) ?? 0) + 1);
+    }
+    const ts = [...perValue.values()].sort((a, b) => b - a);
+    classTriStat = `最大一块 ${ts[0]} 个三角形，中位 ${ts[Math.floor(ts.length / 2)]} 个。`;
+  }
+
+  const items = [
+    hasClass
+      ? { level: 'ok', text: `几何体带分组属性 <b>${classKey}</b>（${classValueCount} 种取值）—— 分组信息就在数据里，直接读属性即可逐个拆块。${classTriStat}` }
+      : { level: 'bad', text: `几何体上没有分组属性（Houdini 的 <code>class</code> / <code>name</code> 没导出），无法直接按碎块拆。` },
+    {
+      level: multiNode ? 'ok' : 'warn',
+      text: multiNode
+        ? `文件有 ${source.nodeCount} 个 node、${source.meshCount} 个 mesh —— 每个 Mesh 也是一个部件。`
+        : `文件只有 ${source.nodeCount} 个 node、${source.meshCount} 个 mesh —— 碎块在场景图层面是合并的。`,
+    },
+    {
+      level: hasGroups ? 'ok' : 'warn',
+      text: hasGroups
+        ? `几何体带 ${sourceMesh.geometry.groups.length} 个 material group。`
+        : `几何体没有 material group（1 个 primitive、无材质），靠 group 分块走不通。`,
+    },
+    {
+      level: weldedCount === positions.length / 3 ? 'warn' : 'ok',
+      text: `原始顶点 ${positions.length / 3} 个，位置去重后 ${weldedCount} 个 —— ${
+        weldedCount === positions.length / 3 ? '每个面都是独立顶点（未焊接）' : `有 ${positions.length / 3 - weldedCount} 个顶点共用`}。`,
+    },
+    {
+      level: connSizes[0] < triCount / 250 ? 'info' : 'warn',
+      text: `按拓扑连通性划分得到 ${connSizes.length} 个连通体，最大一块 ${connSizes[0]} 个三角形${hasClass ? '（有 class 属性时无需依赖它）' : ''}。`,
+    },
+  ];
+
+  const advice = hasClass
+    ? `<p class="hint">推荐用法：<code>geometry.attributes.${classKey}</code> 就是碎块编号，按它分桶逐个建 Mesh —— 见 <code>buildPartsFromVertexAttribute()</code>。这个属性来自 Houdini 的 <code>class</code>，导成 glTF 自定义通道时名字前会加下划线。</p>`
+    : `<p class="hint">想让 three.js 逐个读取碎块，最直接的是改导出：给碎块加 <code>class</code> 或 <code>name</code> 属性并导出。</p>`;
+
+  host.innerHTML =
+    `<ul class="diag">${items.map((it) => `<li><span class="dot ${it.level}"></span><span>${it.text}</span></li>`).join('')}</ul>` + advice;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}

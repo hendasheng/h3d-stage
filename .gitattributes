@@ -1,0 +1,11 @@
+# 统一按 LF 存储，避免 Windows 的 CRLF 在其它平台产生整文件 diff
+* text=auto eol=lf
+
+# 二进制资源不做行尾转换
+*.glb binary
+*.png binary
+*.jpg binary
+*.ico binary
+
+# 锁文件不参与 diff 展示
+package-lock.json -diff

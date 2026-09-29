@@ -1,0 +1,26 @@
+{
+  "name": "h3d-stage",
+  "private": true,
+  "version": "0.2.0-dev",
+  "type": "module",
+  "description": "h3d-stage —— Houdini 产出的 3D 模型接入 three.js，用于实时交互演出场景（OSC 信号驱动后续接入）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4173",
+    "serve": "node tools/serve-dist.mjs 4173",
+    "test:explode": "node --import ./tools/three-stub-loader.mjs tools/test-explode-reset.mjs",
+    "test:smoke": "node tools/smoke-dev.mjs",
+    "check": "node tools/validate.mjs && npm run test:explode && npm run test:smoke"
+  },
+  "dependencies": {
+    "@preact/signals": "^2.11.2",
+    "preact": "^10.29.8",
+    "three": "^0.180.0",
+    "tweakpane": "^4.0.5"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
+    "vite": "^7.0.0"
+  }
+}
