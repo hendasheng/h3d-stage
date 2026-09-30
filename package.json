@@ -1,7 +1,7 @@
 {
   "name": "h3d-stage",
   "private": true,
-  "version": "0.7.0-dev",
+  "version": "0.4.0-dev",
   "type": "module",
   "description": "h3d-stage —— Houdini 产出的 3D 模型接入 three.js，用于实时交互演出场景（OSC 信号驱动后续接入）",
   "scripts": {
