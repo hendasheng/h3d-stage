@@ -158,6 +158,104 @@ ACES 在高强度下会使颜色趋向白色；把乘法挪到 CPU 无法解决�
 Three 默认颜色管理启用，材质存储的是线性值（`#ff8800` 的 G ≈ 0.246）。
 材质数值测试只能验证传值与归零，过曝程度仍需浏览器画面确认。
 
+## 雾：参考站公式与材质注入的五个陷阱
+
+参考效果：`projects.thibautfoussard.com/fog`。它的实现是**材质注入**（不是 three 内置雾、不是后期），
+公式用 CDP 拦截 `WebGL2RenderingContext.shaderSource` 抓原文得到：
+
+```glsl
+float verticalMixer = smoothstep(vWorldPosition.y - fogSmoothness, vWorldPosition.y + fogSmoothness, fogPositionY);
+float distanceToCamera = length(vWorldPosition - cameraPosition);
+float depthMixer = smoothstep(distanceToCamera + fogDepthSmoothness, distanceToCamera - fogDepthSmoothness, fogDepth);
+depthMixer = mix(0., depthMixer, verticalMixer);          // 深度项被高度项门控
+float mixer = verticalMixer * .5 + depthMixer * .95;      // 相加加权，不是二选一
+mixer = clamp(mixer, 0., 1.);
+outgoingLight = mix(outgoingLight, vec3(1.), mixer);      // 参考站混纯白
+```
+
+三条与直觉相反的结论，写断言前必须先想清楚：
+
+- **两项是相加加权**（`*.5 + *.95`），不是 `mix(高度, 深度, k)`。所以 `verticalMixer=1` 且
+  `depthMixer=0` 时画面**已经**有 0.5 的雾量；两者同时饱和会被 `clamp` 到 1。
+- **深度项被高度项门控**：`verticalMixer=0` 的地方（画面整体高于雾面）两项一起归零，
+  这时怎么调 `fogDepth` 都不会有雾。反过来 `verticalMixer=1` 的地方，`fogDepth` 才说了算。
+- **没有"距离雾/高度分层雾"两种模式**，四个参数始终同时生效。自创模式是早先走错的路。
+
+我们的两点改动：混 `uFogColor`（默认纯白，默认画面与参考站一致）而不是写死 `vec3(1.)`；
+混入量乘 `fogEnabled` 以便关断。
+
+### 陷阱一：`outgoingLight` 的合成行每种材质都不一样
+
+给材质注入雾，必须改 `outgoingLight`，但这一行的写法**按材质类型分家**：
+
+| 材质 | 合成行 |
+| --- | --- |
+| Standard / Physical | `vec3 outgoingLight = totalDiffuse + totalSpecular + totalEmissiveRadiance;` |
+| Basic | `vec3 outgoingLight = reflectedLight.indirectDiffuse;` |
+| Lambert / Toon | `vec3 outgoingLight = reflectedLight.directDiffuse + reflectedLight.indirectDiffuse + totalEmissiveRadiance;` |
+| Phong | `…directDiffuse + indirectDiffuse + directSpecular + indirectSpecular + totalEmissiveRadiance;` |
+| Matcap | `vec3 outgoingLight = diffuseColor.rgb * matcapColor.rgb;` |
+| Points / Sprite / Line | `outgoingLight = diffuseColor.rgb;` |
+
+只认第一种（PBR）时，**其它材质的雾是静默消失的**：注入函数被调用了、uniform 也挂上了、
+`customProgramCacheKey` 也变了，唯独那行代码没插进去。表现就是"链路全对、画面一动不动"。
+对策：全部列出，并且在一处都没命中时 `console.error` 报出材质类型，不许静默。
+
+### 陷阱二：varying 名不能照抄，参考站的名字在 three 里已被占用
+
+参考站的 varying 叫 `vWorldPosition`，但 three 的顶点着色器在 `ENV_WORLDPOS` 分支里
+**已经声明过同名 varying**（envmap 用）。照抄 → 同一份 shader 里重复声明 varying →
+顶点着色器编译失败；同时我们并未给它赋值，片元端读到的恒为 0。两个问题叠在一起，
+现象同样是"注入命中但参数完全不动画面"。我们改用 `vH3dWorldPos`。
+
+> 教训：注入型改动的"命中"毫无意义。判据只有两个 ——
+> **编译后的着色器里真的有那段代码**（用 CDP 抓 `shaderSource` 看原文），
+> 以及**像素真的变了**（`readPixels` 回读）。两者都做过才敢说修好了。
+
+### 陷阱三（最致命）：uniform 值改了但不会被上传，画面一动不动
+
+three 的 `getUniformList()` 把「这个程序里哪些 uniform 需要上传」这张表
+**缓存在材质上**（`materialProperties.uniformsList`），而程序是按 `customProgramCacheKey` 缓存的。
+两者合起来：**cacheKey 不变 ⇒ 程序只编译一次 ⇒ 之后改 `uniforms.xxx.value` 永远不会被上传**。
+
+表现极具误导性：注入命中了、`onBeforeCompile` 每次都调用、uniform 对象的现场值也是新的，
+**唯独画面纹丝不动**（真实页面实测：改 depth / height / color，全屏均值恒为 188.71）。
+参考站有同样的结构性问题，只是它把参数喂给 Leva 的初值、从不在运行时改，所以看不出来。
+
+对策（见 `src/fog.js` 的 `stateKey()`）：`customProgramCacheKey()` 里**带上当前参数值**，
+值一变就换一个程序；值变化时给所有已注入材质 `needsUpdate = true`。
+代价是拖滑块会重编译，换来的是"参数真的有效"。判定它有没有修好，**不能看 uniform 值，只能看像素**。
+
+## 背景与几何：天穹为什么存在、尺寸怎么定
+
+参考站（`projects.thibautfoussard.com/fog`）的场景构成与本项目的对应：
+
+| 元素 | 参考站 | 本项目 |
+| --- | --- | --- |
+| 背景 | **渐变天穹**：球体（BackSide）跟随相机，顶 `#000000` → 底 `#ffffff`，分界用**与雾同一个** smoothstep | 同（`src/sky-dome.js`） |
+| 地面 | 圆面 r=100，`MeshStandardMaterial` 色 `#333333`、rough 1、metal 0，放在 `y=-10` | **不要**：雾直接作用于模型本身，地面是多余遮挡 |
+| 主几何 | city.glb 缩放 0.5、`y=-10`，全部换成雾注入材质 | 用户导入的模型 |
+| 光照 | `ambientLight` π/2 + HDR 环境（`backgroundIntensity 0.17`，Cineon，曝光 1） | 项目原有的灯光与 HDR 环境 |
+| 相机 | `fov 110`，位置 `[-28, 4.5, -17]`，target `[0,-10,0]` —— **街面高度看出去** | 项目原有的环绕相机 |
+| 「雾墙」 | 只是个**半径 0.5 的小球**（放在相机位置、`renderOrder 9`），用于可视化雾面高度，**不是实体** | 未实现（不需要） |
+
+**参考站没有背景板、没有雾墙、没有高度参考环**，我们也不要地面。
+地形/落点是可选项而不是前提：雾是按世界坐标算的材质效果，有地面时"低处积雾"更直观，
+没有地面时雾直接染在模型上，同样成立，而且画面更干净（去掉后模型轮廓不再被一块大圆面切掉）。
+
+> 曾经自作主张加过后墙 + 高度参考环 + 大圆地面。前两个纯属臆造；地面则是多余的遮挡。
+
+天穹尺寸的两条约束（都踩过）：
+
+- **太小** → 几何戳到球外面，那部分画面没有背景（实测半径 100 时，一块 z=-12 的板就出界）。
+- **太大** → 球的下半球把整个世界包在"雾面以下"，画面整体刷白（实测半径 2500 时前半屏全白）。
+
+所以取一个中间值（当前 140）。天穹只写色不写深度（`depthWrite: false`），但
+**绝不要 `depthTest: false`** —— 那会让它在最后一个 pass 把整幅画面盖掉（模型全被抹掉）。
+
+`height` 是**世界坐标的绝对值**：调到远大于场景尺寸（比如 2000）等于把整个场景压到雾面之下，
+画面只会整体变白。调参要对照模型的真实高度范围。
+
 ## 环境
 
 - Node v24.18.0 / npm 11.16.0（无 pnpm）

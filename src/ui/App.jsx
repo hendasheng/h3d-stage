@@ -34,6 +34,11 @@ function TweakpaneControls() {
       gtaoIntensity: store.gtaoIntensity.value,
       gtaoRadius: store.gtaoRadius.value,
       fogEnabled: store.fogEnabled.value,
+      fogColor: store.fogColor.value,
+      fogBgMode: store.fogBgMode.value,
+      fogBgColor: store.fogBgColor.value,
+      fogBgTop: store.fogBgTop.value,
+      fogBgBottom: store.fogBgBottom.value,
       fogHeight: store.fogHeight.value,
       fogSmoothness: store.fogSmoothness.value,
       fogDepth: store.fogDepth.value,
@@ -101,16 +106,35 @@ function TweakpaneControls() {
     fGtao.addBinding(params, 'gtaoRadius', { label: '范围', min: 0.05, max: 2, step: 0.01 })
       .on('change', (ev) => { store.gtaoRadius.value = ev.value; });
 
+    // 雾：公式与参考站一致（高度项与深度项相加加权，见 src/fog.js），四个参数始终同时生效。
+    // 雾只作用于模型材质；背景由「背景」子文件夹决定（默认渐变天穹，与雾同一分界）。
     const fFog = fScene.addFolder({ title: '雾', expanded: true });
     fFog.addBinding(params, 'fogEnabled', { label: '开启' })
       .on('change', (ev) => { store.fogEnabled.value = ev.value; });
-    fFog.addBinding(params, 'fogHeight', { label: '覆盖高度', min: -12, max: 12, step: 0.1 })
+    fFog.addBinding(params, 'fogColor', { label: '雾色', picker: 'inline' })
+      .on('change', (ev) => { store.fogColor.value = ev.value; });
+
+    const fFogBg = fFog.addFolder({ title: '背景', expanded: true });
+    fFogBg.addBinding(params, 'fogBgMode', {
+      label: '类型', options: { '天穹（与雾同分界）': 'dome', 纯色: 'flat', 上下渐变: 'gradient' },
+    }).on('change', (ev) => { store.fogBgMode.value = ev.value; });
+    fFogBg.addBinding(params, 'fogBgColor', { label: '纯色', picker: 'inline' })
+      .on('change', (ev) => { store.fogBgColor.value = ev.value; });
+    fFogBg.addBinding(params, 'fogBgTop', { label: '天穹·顶 / 渐变·上', picker: 'inline' })
+      .on('change', (ev) => { store.fogBgTop.value = ev.value; });
+    fFogBg.addBinding(params, 'fogBgBottom', { label: '渐变·下', picker: 'inline' })
+      .on('change', (ev) => { store.fogBgBottom.value = ev.value; });
+
+    const fFogHeight = fFog.addFolder({ title: '高度项', expanded: true });
+    fFogHeight.addBinding(params, 'fogHeight', { label: '雾面高度', min: -40, max: 40, step: 0.1 })
       .on('change', (ev) => { store.fogHeight.value = ev.value; });
-    fFog.addBinding(params, 'fogSmoothness', { label: '过渡范围', min: 0.1, max: 10, step: 0.1 })
+    fFogHeight.addBinding(params, 'fogSmoothness', { label: '高度过渡带', min: 0.1, max: 40, step: 0.1 })
       .on('change', (ev) => { store.fogSmoothness.value = ev.value; });
-    fFog.addBinding(params, 'fogDepth', { label: '深度', min: 0, max: 50, step: 0.1 })
+
+    const fFogDepth = fFog.addFolder({ title: '深度项', expanded: true });
+    fFogDepth.addBinding(params, 'fogDepth', { label: '雾的深度', min: 0, max: 300, step: 1 })
       .on('change', (ev) => { store.fogDepth.value = ev.value; });
-    fFog.addBinding(params, 'fogDepthSmoothness', { label: '深度过渡', min: 0, max: 50, step: 0.1 })
+    fFogDepth.addBinding(params, 'fogDepthSmoothness', { label: '深度过渡带', min: 0.1, max: 100, step: 0.1 })
       .on('change', (ev) => { store.fogDepthSmoothness.value = ev.value; });
 
     const fPart = pane.addFolder({ title: '每个部件', expanded: true });
@@ -174,6 +198,11 @@ function TweakpaneControls() {
         params.gtaoIntensity = store.gtaoIntensity.value;
         params.gtaoRadius = store.gtaoRadius.value;
         params.fogEnabled = store.fogEnabled.value;
+        params.fogColor = store.fogColor.value;
+        params.fogBgMode = store.fogBgMode.value;
+        params.fogBgColor = store.fogBgColor.value;
+        params.fogBgTop = store.fogBgTop.value;
+        params.fogBgBottom = store.fogBgBottom.value;
         params.fogHeight = store.fogHeight.value;
         params.fogSmoothness = store.fogSmoothness.value;
         params.fogDepth = store.fogDepth.value;

@@ -10,7 +10,8 @@ import * as THREE from 'three';
 import { render, h } from 'preact';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createEnvironmentLighting } from './environment.js';
-import { createFogBackdrop, createFogBackground, createFogGround, createVerticalFog } from './fog.js';
+import { createFog } from './fog.js';
+import { createSkyDome } from './sky-dome.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -47,7 +48,8 @@ let renderer, scene, camera, controls, modelRoot, centerGroup, raycaster, worldG
 let keyLight;
 let environmentLighting;
 let composer, bloomPass, gtaoPass;
-let verticalFog, fogBackdrop, fogBackground, fogGround;
+let fog;   // 由 createFog(scene, skyDome) 创建，见 src/fog.js
+let skyDome;   // 渐变天穹（背景），见 src/sky-dome.js
 const auxiliaryLights = [];
 let source = null;          // parseGLBBuffers 的结果
 let sourceMesh = null;      // three.js 侧的基准 Mesh
@@ -118,7 +120,6 @@ async function loadModel(file) {
   modelRadius = Math.max(size.length() * 0.5, 1);
   sourceScene.position.sub(center);
   modelFloorY = box.min.y - center.y;
-  fogGround.position.y = modelFloorY;
   configureKeyShadow(keyLight, modelRadius);
 
   modelRoot = new THREE.Group();
@@ -196,6 +197,17 @@ async function loadModel(file) {
         return { r: m.emissive.r, g: m.emissive.g, b: m.emissive.b };
       },
       glowActive: () => store.glowActive.value.map((e) => e.id),
+      /** 场景/相机/渲染器引用：供 tools 里的 CDP 探测读取真实状态 */
+      scene: () => scene,
+      camera: () => camera,
+      renderer: () => renderer,
+      fogInfo: () => ({
+        sceneFog: scene.fog ? { near: scene.fog.near, far: scene.fog.far, color: '#' + scene.fog.color.getHexString() } : null,
+        background: scene.background?.isColor ? '#' + scene.background.getHexString() : (scene.background ? 'texture' : null),
+        attached: store.parts.filter((p) => p.material?.userData?.__fogAttached).length,
+        domeVisible: skyDome?.dome?.visible ?? false,
+        parts: store.parts.length,
+      }),
     };
   }
 
@@ -270,16 +282,14 @@ function initThree() {
 
   camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.05, 4000);
   camera.position.set(14, 9, 16);
-  fogBackground = createFogBackground({ height: store.fogHeight.value, smoothness: store.fogSmoothness.value });
-  scene.add(fogBackground.mesh);
-  fogBackdrop = createFogBackdrop({
-    enabled: store.fogEnabled.value,
-    height: store.fogHeight.value,
-    smoothness: store.fogSmoothness.value,
-  }, camera);
-  scene.add(fogBackdrop.mesh);
-  fogGround = createFogGround();
-  scene.add(fogGround);
+
+  // 背景 = 渐变天穹（顶 bgTop → 底雾色，与雾面无缝衔接），见 src/sky-dome.js。
+  // 天穹在 createFog 之前建好 —— 雾要把 height/smoothness/颜色同步给它。
+  skyDome = createSkyDome();
+  scene.add(skyDome.dome);
+
+  // 雾（材质注入）
+  fog = createFog(scene, skyDome);
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
@@ -305,6 +315,8 @@ function initThree() {
   worldGrid = new THREE.GridHelper(GRID_SIZE, GRID_SIZE, 0x4a5568, 0x2a323d);
   worldGrid.visible = store.showGrid.value;
   scene.add(worldGrid);
+
+  // 环境（地面 + 渐变天穹）在相机之后、雾之前创建，见上面的说明
 
   raycaster = new THREE.Raycaster();
 
@@ -338,6 +350,8 @@ function initThree() {
 function tick() {
   if (store.spin.value && modelRoot) modelRoot.rotation.y += 0.0025;
   controls.update();
+  // 天穹每帧跟随相机：半径远小于远裁剪面，不跟随就会"走出天空"
+  skyDome?.followCamera(camera);
   let needRender = true;
 
   // 只要曾经炸开过就继续调用 —— 包括 factor 归零那一帧，
@@ -349,7 +363,6 @@ function tick() {
 
   // 材质驱动：每帧按时间戳算各 class 的发光强度（与帧率无关），并写进材质
   if (glowActiveCount()) updateGlow();
-  fogBackdrop?.tick(performance.now() / 1000);
 
   if (needRender) {
     if (store.bloomEnabled.value) composer.render();
@@ -483,25 +496,13 @@ function initControlsWiring() {
   store.gtaoEnabled.subscribe((value) => { gtaoPass.enabled = value; });
   store.gtaoIntensity.subscribe((value) => { gtaoPass.blendIntensity = value; });
   store.gtaoRadius.subscribe((value) => { gtaoPass.updateGtaoMaterial({ radius: value }); });
-  const updateFog = () => verticalFog?.update({
-    enabled: store.fogEnabled.value,
-    height: store.fogHeight.value,
-    smoothness: store.fogSmoothness.value,
-    depth: store.fogDepth.value,
-    depthSmoothness: store.fogDepthSmoothness.value,
-  });
-  const updateFogBackdrop = () => fogBackdrop?.update({
-    enabled: store.fogEnabled.value,
-    height: store.fogHeight.value,
-    smoothness: store.fogSmoothness.value,
-  });
-  const updateFogBackground = () => fogBackground?.update({ height: store.fogHeight.value, smoothness: store.fogSmoothness.value });
-  const updateAllFog = () => { updateFog(); updateFogBackdrop(); updateFogBackground(); };
-  store.fogEnabled.subscribe(updateAllFog);
-  store.fogHeight.subscribe(updateAllFog);
-  store.fogSmoothness.subscribe(updateAllFog);
-  store.fogDepth.subscribe(updateAllFog);
-  store.fogDepthSmoothness.subscribe(updateAllFog);
+  // 雾：设置变了就整体重新应用（背景与雾分开，见 src/fog.js）
+  const applyFog = () => applyFogCurrent();
+  for (const sig of [store.fogEnabled, store.fogColor, store.fogBgMode,
+    store.fogBgColor, store.fogBgTop, store.fogBgBottom,
+    store.fogHeight, store.fogSmoothness, store.fogDepth, store.fogDepthSmoothness]) {
+    sig.subscribe(applyFog);
+  }
   // subscribe 的回调会立即同步执行一次；模型没加载完之前不要真的重建
   store.model.subscribe((file) => {
     if (file && file !== store.info.value.model) void loadModel(file);
@@ -532,7 +533,6 @@ function initControlsWiring() {
 /* ================================================================== */
 
 function clearParts() {
-  verticalFog = null;
   for (const p of store.parts) {
     p.object.parent?.remove(p.object);
     if (p.source !== 'node') {
@@ -573,19 +573,31 @@ async function buildParts() {
 
   applyColors();
   setWireframe(store.parts, store.wireframe.value);
-  verticalFog = createVerticalFog({
-    enabled: store.fogEnabled.value,
-    height: store.fogHeight.value,
-    smoothness: store.fogSmoothness.value,
-    depth: store.fogDepth.value,
-    depthSmoothness: store.fogDepthSmoothness.value,
-  });
-  verticalFog.attach(store.parts);
+  // 新模型的材质是新的：竖直分层雾需要重新注入（线性雾不用）
+  applyFogCurrent();
   classMaterials = buildClassMaterialIndex(store.parts);   // class → 材质，发光时按编号直取
   glow.clearAll();
   store.glowActive.value = [];
   touch();
   updateDebug();
+}
+
+/** 用当前 store 里的设置应用一次雾（buildParts 之后材质变了要重来一次） */
+function applyFogCurrent() {
+  // 只注入模型部件：没有地面之后，判断标准就是"模型本身有没有被雾染"
+  const targets = store.parts;
+  fog?.update({
+    enabled: store.fogEnabled.value,
+    color: store.fogColor.value,
+    bgMode: store.fogBgMode.value,
+    bgColor: store.fogBgColor.value,
+    bgTop: store.fogBgTop.value,
+    bgBottom: store.fogBgBottom.value,
+    height: store.fogHeight.value,
+    smoothness: store.fogSmoothness.value,
+    depth: store.fogDepth.value,
+    depthSmoothness: store.fogDepthSmoothness.value,
+  }, targets);
 }
 
 /**

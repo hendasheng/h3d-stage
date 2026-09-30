@@ -16,6 +16,7 @@
     "test:shadows": "node tools/test-shadows.mjs",
     "test:smoke": "node tools/smoke-dev.mjs",
     "probe:glow": "node tools/probe-glow-cdp.mjs",
+    "probe:fog": "node tools/probe-fog-pixels.mjs",
     "check": "node tools/validate.mjs && npm run test:glow && npm run test:environment && npm run test:fog && npm run test:shadows && npm run test:explode && npm run test:smoke"
   },
   "dependencies": {

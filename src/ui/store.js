@@ -25,11 +25,18 @@ export const store = {
   gtaoEnabled: signal(true),
   gtaoIntensity: signal(0.6),
   gtaoRadius: signal(0.35),
+  // 雾：公式与参考站一致（高度项 + 深度项相加加权），四个参数始终同时生效
   fogEnabled: signal(true),
-  fogHeight: signal(-5),
-  fogSmoothness: signal(3),
-  fogDepth: signal(30),
-  fogDepthSmoothness: signal(15),
+  fogColor: signal('#ffffff'),
+  fogBgMode: signal('dome'),
+  fogBgColor: signal('#000000'),
+  fogBgTop: signal('#000000'),
+  fogBgBottom: signal('#ffffff'),
+  fogHeight: signal(-2),          // fogPositionY
+  fogSmoothness: signal(5),       // fogSmoothness
+  fogDepth: signal(70),           // fogDepth
+  fogDepthSmoothness: signal(25), // fogDepthSmoothness
+  // 背景天穹的显隐由 fog.js 按「背景类型」控制，没有独立开关
   environment: signal('room'),
   environmentIntensity: signal(1),
   lightIntensity: signal(1),      // 原有三盏辅助灯的共同倍率
