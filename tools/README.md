@@ -9,13 +9,16 @@
 | `test-explode-reset.mjs` | 炸开滑块**归零复位**专项测试（直接导入真实的 `src/main.js`） | `npm run test:explode` |
 | `smoke-dev.mjs` | dev 模块转换检查：抓"页面根本打不开"（React 残留、裸包名 import、依赖未预构建） | `npm run test:smoke` |
 | `test-environment.mjs` | HDR 解析、环境切换、失败回退、异步竞态与资源释放（GPU 预过滤用桩） | `npm run test:environment` |
-| `test-fog.mjs` | 指定示例雾的材质注入、背景球、相机球与圆形地面 | `npm run test:fog` |
+| `test-fog.mjs` | 雾的材质注入、背景三态与天穹同步、声明完整性、cacheKey 随参数变化、动态噪声与 `tick` | `npm run test:fog` |
+| `gen-noise-texture.mjs` | 生成动态雾用的**无缝**噪声贴图（周期性梯度噪声，自检接缝）；`--check` 只校验不写 | `npm run gen:noise` |
+| `probe-fog-pixels.mjs` | 真实 WebGL **像素回读**：雾的高度/深度项、天穹渐变、动态噪声（需 dev server） | `npm run probe:fog` |
+| `probe-glow-cdp.mjs` | 真实 WebGL 下检查发光材质通道（需 dev server） | `npm run probe:glow` |
 | `test-shadows.mjs` | 主光阴影范围与每个 class 的投射 / 接收标记 | `npm run test:shadows` |
 | `verify-hdr-presets.mjs` | 按需联网检查官方 HDR 资源 HTTP、跨域许可与实际解析 | `node tools/verify-hdr-presets.mjs` |
 | `serve-dist.mjs` | 极简静态服务器，预览 `dist/`（不依赖 esbuild，可在受限环境跑） | `npm run serve` |
 | `model-file.mjs` | 定位当前模型文件（**不写死文件名**，供下面两个测试共用） | — |
 | `three-stub-loader.mjs` | 模块加载钩子入口（`--import` 用），供上面两个测试挂桩 | — |
-| `three-stub-hooks.mjs` | 钩子实现：把 `three` 换成桩、`.css`/`.jsx`/`.json` 转成 Node 可加载的模块 | — |
+| `three-stub-hooks.mjs` | 钩子实现：把 `three` 换成桩，`.css`/`.jsx`/`.png`/`.json` 转成 Node 可加载的模块 | — |
 
 一键跑全部自检：`npm run check`
 

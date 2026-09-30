@@ -226,6 +226,57 @@ three 的 `getUniformList()` 把「这个程序里哪些 uniform 需要上传」
 值一变就换一个程序；值变化时给所有已注入材质 `needsUpdate = true`。
 代价是拖滑块会重编译，换来的是"参数真的有效"。判定它有没有修好，**不能看 uniform 值，只能看像素**。
 
+## 动态雾（0.5）：噪声只扰动雾面高度
+
+来源：Codrops《The Sleepers》（同一作者 Thibaut Foussard）。核心做法是**用一张无缝噪声贴图代替运行时算噪声**
+——雾要注入到场景里每个材质，每帧每像素现算噪声代价太大。
+
+本项目的注入（见 `src/fog.js`）：
+
+```glsl
+vec2 noiseUv = vH3dWorldPos.xz * fogNoiseScale
+             + vec2(uFogTime * fogFlow.x, uFogTime * fogFlow.y);
+vec2 warpOffset = texture2D(uFogNoise, noiseUv * 0.37).rg - 0.5;   // domain warp
+float noise = texture2D(uFogNoise, noiseUv + warpOffset * fogWarp).r;
+float noiseOffset = (noise - 0.5) * fogNoiseStrength * fogDynamic;
+
+float verticalMixer = smoothstep(y - fogSmoothness, y + fogSmoothness,
+                                 fogPositionY + noiseOffset);
+// …其余与 0.4 完全一致
+```
+
+四个设计点：
+
+- **只动雾面高度**。噪声不参与深度项、不改混合权重，所以 `dynamic = 0` 时画面与 0.4 逐像素一致
+  （探针实测：关动态后推进时间，变化像素数为 0）。
+- **沿世界 xz 平面采样**。雾面是水平的，噪声该像一张铺在地面上的图，而不是贴在模型表面。
+- **domain warp** 让流动不规则：拿第一层噪声去推歪采样位置，比单纯平移更像雾。
+- **时间不进 cacheKey**。`uFogTime` 每帧都变，进指纹就等于每帧重编译；它只改 uniform 值。
+
+### 两个量级陷阱（都让我误判过"噪声没生效"）
+
+1. **噪声贴图必须在 `bindUniforms` 里更新，不能只在构造时写一次。**
+   否则运行期传进来的贴图永远不会绑到 sampler 上，采到的是未绑定纹理（纯黑），
+   于是"噪声"恒为常数、画面纹丝不动。
+2. **强度要和 `smoothness`（高度过渡带）同量级才看得见。**
+   过渡带 5 宽时，强度 0.35 只把界线推动 ±0.17（约 3%），肉眼看不出；
+   强度 6 时开关动态有约 14% 的像素变化。`noiseScale` 也不是越大越好：
+   它决定"一个噪声周期跨多少世界单位"（`1/noiseScale`），
+   若远大于模型尺寸，整个模型只落在一个噪声块里，雾界线只能整体平移、出不来起伏。
+
+### 噪声贴图怎么来的
+
+`tools/gen-noise-texture.mjs`（`npm run gen:noise`）程序生成，产物
+`src/assets/textures/noise-tileable.png` 随源码打包（59 KB，8 位灰度）。
+
+- **周期性梯度噪声**：格点哈希时把整数坐标对 period 取模，
+  于是 `x = period` 与 `x = 0` 得到同一个哈希，边界天然连续。实测接缝跳变为 **0**。
+- fBm 叠 4 层，每层周期同步翻倍，整体仍然严格平铺。
+- 贴图值域拉到满量程，少浪费 8 位精度。
+- `npm run check` 里带 `--check`，会比对文件与生成结果是否一致，防止手改或忘记重新生成。
+
+> 8 位精度够用：噪声只用于推动雾界线，量化台阶远小于过渡带宽度，实测画面无可见条带。
+
 ## 背景与几何：天穹为什么存在、尺寸怎么定
 
 参考站（`projects.thibautfoussard.com/fog`）的场景构成与本项目的对应：

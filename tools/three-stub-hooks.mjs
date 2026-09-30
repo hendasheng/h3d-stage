@@ -5,6 +5,7 @@
  *   · `three`            → 桩（Node 里没有 WebGL；WebGLRenderer / PMREMGenerator 换成假的）
  *   · `./models.js`      → 桩（里面用了 Vite 专有的 import.meta.glob，Node 无法求值）
  *   · `.css` / `.jsx`    → 空桩（由 Vite 处理，测试不需要）
+ *   · `.png` / `.hdr` 等 → 空 URL 桩（`?url` 是 Vite 专有写法，Node 不认这些扩展名）
  *   · `.json`            → 转成 JS 模块（版本号来自 package.json 具名导入）
  */
 const REAL_THREE = new URL('../node_modules/three/build/three.module.js', import.meta.url).href;
@@ -61,6 +62,11 @@ export async function resolve(specifier, context, next) {
   }
   if (specifier.endsWith('.jsx')) {
     return { url: 'data:text/javascript,export const App = () => null;', shortCircuit: true, format: 'module' };
+  }
+  // 图片资源：`import url from './x.png?url'` 是 Vite 专有写法，Node 认不出 .png。
+  // 测试不需要真图，给个空 URL 即可（雾的噪声贴图走这条路）。
+  if (/\.(png|jpe?g|webp|gif|ktx2|hdr)(\?|$)/i.test(specifier)) {
+    return { url: 'data:text/javascript,export default ""', shortCircuit: true, format: 'module' };
   }
   // JSON 在浏览器里由 Vite 处理，Node 里转成 JS 模块转发（package.json 的版本号靠它）
   if (specifier.endsWith('.json')) {

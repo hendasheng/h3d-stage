@@ -43,6 +43,12 @@ function TweakpaneControls() {
       fogSmoothness: store.fogSmoothness.value,
       fogDepth: store.fogDepth.value,
       fogDepthSmoothness: store.fogDepthSmoothness.value,
+      fogDynamic: store.fogDynamic.value,
+      fogNoiseStrength: store.fogNoiseStrength.value,
+      fogNoiseScale: store.fogNoiseScale.value,
+      fogFlowX: store.fogFlowX.value,
+      fogFlowY: store.fogFlowY.value,
+      fogWarp: store.fogWarp.value,
       environment: store.environment.value,
       environmentIntensity: store.environmentIntensity.value,
       lightIntensity: store.lightIntensity.value,
@@ -137,6 +143,21 @@ function TweakpaneControls() {
     fFogDepth.addBinding(params, 'fogDepthSmoothness', { label: '深度过渡带', min: 0.1, max: 100, step: 0.1 })
       .on('change', (ev) => { store.fogDepthSmoothness.value = ev.value; });
 
+    // 动态雾（0.5）：噪声把雾面高度推起来，并沿时间流动。关掉后噪声完全不参与。
+    const fFogDyn = fFog.addFolder({ title: '动态（噪声）', expanded: true });
+    fFogDyn.addBinding(params, 'fogDynamic', { label: '开启' })
+      .on('change', (ev) => { store.fogDynamic.value = ev.value; });
+    fFogDyn.addBinding(params, 'fogNoiseStrength', { label: '起伏强度', min: 0, max: 20, step: 0.1 })
+      .on('change', (ev) => { store.fogNoiseStrength.value = ev.value; });
+    fFogDyn.addBinding(params, 'fogNoiseScale', { label: '噪声疏密', min: 0.005, max: 0.5, step: 0.001 })
+      .on('change', (ev) => { store.fogNoiseScale.value = ev.value; });
+    fFogDyn.addBinding(params, 'fogFlowX', { label: '流动 X', min: -0.2, max: 0.2, step: 0.001 })
+      .on('change', (ev) => { store.fogFlowX.value = ev.value; });
+    fFogDyn.addBinding(params, 'fogFlowY', { label: '流动 Y', min: -0.2, max: 0.2, step: 0.001 })
+      .on('change', (ev) => { store.fogFlowY.value = ev.value; });
+    fFogDyn.addBinding(params, 'fogWarp', { label: '不规则程度', min: 0, max: 2, step: 0.01 })
+      .on('change', (ev) => { store.fogWarp.value = ev.value; });
+
     const fPart = pane.addFolder({ title: '每个部件', expanded: true });
     fPart.addBinding(params, 'explode', { label: '炸开距离', min: 0, max: 2, step: 0.01 })
       .on('change', (ev) => { store.explode.value = ev.value; });
@@ -207,6 +228,12 @@ function TweakpaneControls() {
         params.fogSmoothness = store.fogSmoothness.value;
         params.fogDepth = store.fogDepth.value;
         params.fogDepthSmoothness = store.fogDepthSmoothness.value;
+        params.fogDynamic = store.fogDynamic.value;
+        params.fogNoiseStrength = store.fogNoiseStrength.value;
+        params.fogNoiseScale = store.fogNoiseScale.value;
+        params.fogFlowX = store.fogFlowX.value;
+        params.fogFlowY = store.fogFlowY.value;
+        params.fogWarp = store.fogWarp.value;
         params.environment = store.environment.value;
         params.environmentStatus = store.environmentStatus.value;
         params.environmentIntensity = store.environmentIntensity.value;

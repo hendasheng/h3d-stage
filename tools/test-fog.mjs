@@ -52,6 +52,10 @@ ok('三种背景模式可选（天穹 / 纯色 / 渐变）', BACKGROUND_MODES.le
 ok('四参数齐备（高度项 ×2 / 深度项 ×2）',
   ['height', 'smoothness', 'depth', 'depthSmoothness'].every((k) => typeof FOG_DEFAULTS[k] === 'number'),
   ['height', 'smoothness', 'depth', 'depthSmoothness'].map((k) => `${k}=${FOG_DEFAULTS[k]}`).join(' '));
+ok('动态雾参数齐备（0.5）',
+  typeof FOG_DEFAULTS.dynamic === 'boolean'
+  && ['noiseStrength', 'noiseScale', 'flowX', 'flowY', 'warp'].every((k) => typeof FOG_DEFAULTS[k] === 'number'),
+  ['noiseStrength', 'noiseScale', 'flowX', 'flowY', 'warp'].map((k) => `${k}=${FOG_DEFAULTS[k]}`).join(' '));
 
 console.log('\n=== 2. 注入落地 ===');
 const parts = [{ material }];
@@ -84,13 +88,21 @@ ok('vertex 注入了 vH3dWorldPos 与赋值', /varying vec3 vH3dWorldPos;/.test(
     decls.filter((d) => d === 'vWorldPosition').length === 1 && decls.includes('vH3dWorldPos'),
     decls.join(','));
 }
-ok('fragment 注入了垂直项', /float verticalMixer = smoothstep\(vH3dWorldPos\.y - fogSmoothness, vH3dWorldPos\.y \+ fogSmoothness, fogPositionY\);/.test(sh1.fragmentShader));
+// 动态雾把噪声加在**雾面高度**上（fogPositionY + noiseOffset），公式其余部分一个字不改，
+// 所以 dynamic = 0 时画面与 0.4 逐像素一致。
+ok('动态：噪声加在雾面高度上', /smoothstep\(vH3dWorldPos\.y - fogSmoothness, vH3dWorldPos\.y \+ fogSmoothness, fogPositionY \+ noiseOffset\)/.test(sh1.fragmentShader));
+ok('动态：噪声来自贴图而不是现算', /texture2D\(uFogNoise,/.test(sh1.fragmentShader));
+ok('动态：沿 xz 平面采样（雾面是水平的）', /vH3dWorldPos\.xz \* fogNoiseScale/.test(sh1.fragmentShader));
+ok('动态：有 domain warp', /warpOffset/.test(sh1.fragmentShader) && /fogWarp/.test(sh1.fragmentShader));
+ok('动态：由 fogDynamic 开关（0 时噪声不参与）', /\* fogDynamic;/.test(sh1.fragmentShader));
+ok('动态：以时间流动', /uFogTime \* fogFlow\.x/.test(sh1.fragmentShader));
 ok('fragment 注入了深度项', /float depthMixer = smoothstep\(distanceToCamera \+ fogDepthSmoothness, distanceToCamera - fogDepthSmoothness, fogDepth\);/.test(sh1.fragmentShader));
 ok('深度项被高度项门控', /depthMixer = mix\(0\., depthMixer, verticalMixer\);/.test(sh1.fragmentShader));
 ok('相加加权 .5/.95（不是二选一混合）', /float mixer = verticalMixer \* \.5 \+ depthMixer \* \.95;/.test(sh1.fragmentShader));
 ok('混入雾色 uFogColor', /outgoingLight = mix\(outgoingLight, uFogColor, mixer\);/.test(sh1.fragmentShader));
-ok('uniforms 已挂上', Object.keys(sh1.uniforms).join(',') ===
-  'uFogColor,fogPositionY,fogSmoothness,fogDepth,fogDepthSmoothness,fogEnabled',
+ok('uniforms 已挂上（含 0.5 的动态雾 uniform）', Object.keys(sh1.uniforms).join(',') ===
+  'uFogColor,fogPositionY,fogSmoothness,fogDepth,fogDepthSmoothness,fogEnabled,'
+  + 'uFogNoise,fogNoiseScale,fogNoiseStrength,uFogTime,fogDynamic,fogFlow,fogWarp',
   Object.keys(sh1.uniforms).join(','));
 
 console.log('\n=== 3. uniform 值随设置更新（同一对象，不重建）===');
@@ -158,14 +170,19 @@ console.log('\n=== 5b. 天穹同步（背景与雾必须同一分界，否则雾
 console.log('\n=== 6. 声明完整性（曾漏声明导致整块渲白）===');
 fog.update({ bgMode: 'flat', bgColor: '#000000' }, parts);
 const frag = sh4.fragmentShader;
-const names = ['uFogColor', 'fogPositionY', 'fogSmoothness', 'fogDepth', 'fogDepthSmoothness', 'fogEnabled'];
+const names = ['uFogColor', 'fogPositionY', 'fogSmoothness', 'fogDepth', 'fogDepthSmoothness', 'fogEnabled',
+  'uFogNoise', 'fogNoiseScale', 'fogNoiseStrength', 'uFogTime', 'fogDynamic', 'fogFlow', 'fogWarp'];
 const declared = new Set([...frag.matchAll(/uniform\s+\w+\s+([A-Za-z_]\w*)\s*;/g)].map((m) => m[1]));
 const undeclared = names.filter((u) => !declared.has(u));
 ok('注入声明的雾 uniform 全部齐备', undeclared.length === 0, undeclared.join(',') || '无遗漏');
-const occurrencesOf = (name) => frag.split(`uniform float ${name};`).length - 1
-  + frag.split(`uniform vec3 ${name};`).length - 1;
+const occurrencesOf = (name) => [...frag.matchAll(new RegExp(`uniform\\s+\\w+\\s+${name}\\s*;`, 'g'))].length;
 ok('声明数量与用法一致（不重复）', names.every((n) => occurrencesOf(n) === 1),
   names.map((n) => `${n}×${occurrencesOf(n)}`).join(' '));
+// 只声明还不够：着色器里用到的每个 uniform 标识符都必须真的出现过声明，
+// 否则又是"用了没声明 → 整块渲白"（踩过）。这里反向查一遍。
+const usedIds = new Set([...frag.matchAll(/\b(u?Fog[A-Za-z]\w*|fog[A-Z]\w*|uFog\w*)\b/g)].map((m) => m[1]));
+const notDeclared = [...usedIds].filter((id) => !declared.has(id) && names.includes(id));
+ok('用到的标识符都有声明（反向查）', notDeclared.length === 0, notDeclared.join(',') || '无遗漏');
 ok('vH3dWorldPos 在 vertex 与 fragment 两端都声明',
   /varying vec3 vH3dWorldPos;/.test(sh4.vertexShader) && /varying vec3 vH3dWorldPos;/.test(frag));
 
@@ -192,6 +209,33 @@ ok('值改回来 → cacheKey 也回到原样（程序可复用）', keyA === ke
 ok('tune 返回 true', fog.tune({ depth: 33, height: -5 }) === true);
 ok('tune 改了 uniform', sh4.uniforms.fogDepth.value === 33 && sh4.uniforms.fogPositionY.value === -5,
   `depth=${sh4.uniforms.fogDepth.value} height=${sh4.uniforms.fogPositionY.value}`);
+// 动态参数与其它参数同受"值变了必须换程序"的约束
+ok('改起伏强度 → cacheKey 变', keyFor({ noiseStrength: 1.2 }) !== keyFor({ noiseStrength: 0.35 }));
+ok('改流动速度 → cacheKey 变', keyFor({ flowX: 0.2 }) !== keyFor({ flowX: 0.012 }));
+ok('关掉动态 → cacheKey 变', keyFor({ dynamic: false }) !== keyFor({ dynamic: true }));
+
+console.log('\n=== 7b. tick：推进流动时间，但绝不触发重编译 ===');
+{
+  fog.update({ dynamic: true, flowX: 0.012 }, parts);
+  const versionBefore = material.version;
+  const t0 = fog.time;
+  fog.tick(0.5);
+  fog.tick(0.5);
+  ok('tick 累加了流动时间', Math.abs(fog.time - (t0 + 1)) < 1e-9, `${t0} -> ${fog.time}`);
+  ok('tick 不触发重编译（uFogTime 不进指纹）', material.version === versionBefore,
+    `${versionBefore} -> ${material.version}`);
+  ok('tick 后 uniform 里的时间与 fog.time 一致', sh4.uniforms.uFogTime.value === fog.time,
+    `uniform=${sh4.uniforms.uFogTime.value} getter=${fog.time}`);
+  fog.tick(-1);
+  fog.tick(NaN);
+  ok('非法 dt 被忽略（负数 / NaN）', Math.abs(fog.time - (t0 + 1)) < 1e-9, String(fog.time));
+  fog.resetTime();
+  ok('resetTime 归零', fog.time === 0, String(fog.time));
+  // 长时间运行：取模避免浮点精度下降，且不该溢出
+  for (let i = 0; i < 5000; i++) fog.tick(1);
+  ok('长时间推进不会溢出或掉精度', fog.time >= 0 && fog.time < 3600, String(fog.time));
+  fog.resetTime();
+}
 
 console.log('\n=== 8. 幂等：反复 update 不会叠加注入 ===');
 const hookAfterFirst = material.onBeforeCompile;

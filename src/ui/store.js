@@ -36,6 +36,13 @@ export const store = {
   fogSmoothness: signal(5),       // fogSmoothness
   fogDepth: signal(70),           // fogDepth
   fogDepthSmoothness: signal(25), // fogDepthSmoothness
+  // 动态雾（0.5）：噪声把雾面高度推起来，并且自己流动
+  fogDynamic: signal(true),
+  fogNoiseStrength: signal(6),    // 雾面上下起伏多少（世界单位峰谷差，与高度过渡带同量级才看得出）
+  fogNoiseScale: signal(0.06),    // 噪声疏密：1/scale ≈ 一个噪声周期跨多少世界单位
+  fogFlowX: signal(0.012),        // 流动速度（噪声 UV/秒）
+  fogFlowY: signal(0.007),
+  fogWarp: signal(0.35),          // domain warp 强度：流动不规则的程度
   // 背景天穹的显隐由 fog.js 按「背景类型」控制，没有独立开关
   environment: signal('room'),
   environmentIntensity: signal(1),

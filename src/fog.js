@@ -71,6 +71,18 @@ export const FOG_DEFAULTS = {
   smoothness: 5,           // fogSmoothness：高度过渡带
   depth: 70,               // fogDepth：深度分界距离
   depthSmoothness: 25,     // fogDepthSmoothness：深度过渡带
+
+  /* 以下为 0.5 的动态雾参数（见 NOTES.md 的「动态雾」） */
+  dynamic: true,           // 关掉时噪声完全不参与，画面应与 0.4 逐像素一致
+  // 噪声把雾面高度上下推动多少（世界单位，**峰谷差**）。
+  // 这个值要和 smoothness（高度过渡带）同量级才看得出起伏：
+  // 过渡带 5 宽、强度也是 5 时，雾界线会被推得明显起伏；
+  // 早期默认 0.35（±0.17 对 10 宽的过渡带 = 1.7% 偏移）实测几乎看不出变化。
+  noiseStrength: 6,
+  noiseScale: 0.06,        // 世界坐标 → 噪声 UV 的缩放：1/0.06 ≈ 每 16.7 个单位一个噪声周期
+  flowX: 0.012,            // 流动速度（噪声 UV/秒，沿 x）
+  flowY: 0.007,            // 流动速度（噪声 UV/秒，沿 y）
+  warp: 0.35,              // domain warp：用一层噪声把采样位置推歪，流动才不规则
 };
 
 /**
@@ -79,11 +91,19 @@ export const FOG_DEFAULTS = {
  * @param {THREE.Scene} scene
  * @param {object} [dome] 渐变天穹（src/sky-dome.js）；给了就与雾同步分界与颜色。
  *   天穹自带背景，所以 bgMode='dome' 时**不设** scene.background —— 设了会把天穹整个盖住。
+ * @param {THREE.Texture} [noiseTexture] 无缝噪声贴图（src/fog-texture.js）。
+ *   **故意做成参数而不是在这里 import**：`src/fog-texture.js` 用 `?url` 导入 PNG，
+ *   那是 Vite 专有语法，Node 测试里会解析失败。测试传 `null` 或不传即可，
+ *   动态雾本身照常可测（只断言噪声参与运算，不依赖真实贴图内容）。
  */
-export function createFog(scene, dome = null) {
+export function createFog(scene, dome = null, noiseTexture = null) {
   const gradient = createGradientBackground();
   scene.background = null;
   scene.fog = null;                       // 不用内置雾
+  // 当前噪声贴图。**必须放在闭包里可变**：只在构造时写一次的话，
+  // 之后传进来的贴图永远不会被绑上 sampler（踩过：探针里噪声恒定"没反应"，
+  // 查到底才发现 uFogNoise 一直指向构造时的那个 null）。
+  let noise = noiseTexture;
 
   /** 已注入的材质 → 共享 uniforms；始终是 Map，避免"已注入"分支拿到 null */
   const injected = new Map();
@@ -99,10 +119,18 @@ export function createFog(scene, dome = null) {
     fogDepth: { value: FOG_DEFAULTS.depth },
     fogDepthSmoothness: { value: FOG_DEFAULTS.depthSmoothness },
     fogEnabled: { value: 0 },
+    // 动态：噪声贴图 + 世界坐标缩放 + 起伏强度 + 已推进的"流动时间"
+    uFogNoise: { value: noise },
+    fogNoiseScale: { value: FOG_DEFAULTS.noiseScale },
+    fogNoiseStrength: { value: FOG_DEFAULTS.noiseStrength },
+    uFogTime: { value: 0 },
+    fogDynamic: { value: FOG_DEFAULTS.dynamic ? 1 : 0 },
+    fogFlow: { value: new THREE.Vector2(FOG_DEFAULTS.flowX, FOG_DEFAULTS.flowY) },
+    fogWarp: { value: FOG_DEFAULTS.warp },
   };
 
   /**
-   * 注入雾 —— **逐行照抄参考站的实现**（用 CDP 拦截它的 shaderSource 得到的原文）：
+   * 注入雾 —— 公式取自参考站（用 CDP 拦截它的 shaderSource 得到的原文）：
    *
    *   float verticalMixer = smoothstep(vWorldPosition.y - fogSmoothness,
    *                                    vWorldPosition.y + fogSmoothness, fogPositionY);
@@ -124,10 +152,23 @@ export function createFog(scene, dome = null) {
    *  3. 混入的是**纯白** vec3(1.)，不是雾色 uniform —— 我们改成混 uFogColor，
    *     默认值就是纯白，所以默认画面与参考站一致，同时"雾色"滑块才有意义
    *  4. 混入量还要乘 fogEnabled 才能关掉（参考站用宏判断）
+   *
+   * 动态化（0.5，见 NOTES.md 的「动态雾」）：
+   *   · 噪声来自**贴图**而不是现算 —— 雾注入到每个材质上，现算噪声每像素都要付一遍代价
+   *   · 噪声只扰动**雾面高度**（`fogPositionY + noiseOffset`），公式其余部分一概不动，
+   *     所以关掉动态时画面与 0.4 逐像素一致
+   *   · 沿时间轴平移采样坐标 = 雾自己流动；再做一次低成本 domain warp 让流动不规则
    */
   function attach(parts) {
     const code = `
-      float verticalMixer = smoothstep(vH3dWorldPos.y - fogSmoothness, vH3dWorldPos.y + fogSmoothness, fogPositionY);
+      // 噪声：取世界 xz 平面作为雾的"地面"（雾面是水平的，沿 xz 铺开才对）
+      vec2 noiseUv = vH3dWorldPos.xz * fogNoiseScale + vec2(uFogTime * fogFlow.x, uFogTime * fogFlow.y);
+      // domain warp：用第一层噪声把采样位置推歪，得到不规则、不同步的流动
+      vec2 warpOffset = texture2D(uFogNoise, noiseUv * 0.37).rg - 0.5;
+      float noise = texture2D(uFogNoise, noiseUv + warpOffset * fogWarp).r;
+      float noiseOffset = (noise - 0.5) * fogNoiseStrength * fogDynamic;
+
+      float verticalMixer = smoothstep(vH3dWorldPos.y - fogSmoothness, vH3dWorldPos.y + fogSmoothness, fogPositionY + noiseOffset);
       float distanceToCamera = length(vH3dWorldPos - cameraPosition);
       float depthMixer = smoothstep(distanceToCamera + fogDepthSmoothness, distanceToCamera - fogDepthSmoothness, fogDepth);
       depthMixer = mix(0., depthMixer, verticalMixer);
@@ -174,7 +215,21 @@ export function createFog(scene, dome = null) {
         let fragment = shader.fragmentShader.replace(
           '#include <common>',
           // 声明必须与代码里用到的 uniform 完全一致：少一个就编译失败（踩过，整块渲白）
-          '#include <common>\nvarying vec3 vH3dWorldPos;\nuniform vec3 uFogColor;\nuniform float fogPositionY;\nuniform float fogSmoothness;\nuniform float fogDepth;\nuniform float fogDepthSmoothness;\nuniform float fogEnabled;'
+          '#include <common>\n'
+          + 'varying vec3 vH3dWorldPos;\n'
+          + 'uniform vec3 uFogColor;\n'
+          + 'uniform float fogPositionY;\n'
+          + 'uniform float fogSmoothness;\n'
+          + 'uniform float fogDepth;\n'
+          + 'uniform float fogDepthSmoothness;\n'
+          + 'uniform float fogEnabled;\n'
+          + 'uniform sampler2D uFogNoise;\n'
+          + 'uniform float fogNoiseScale;\n'
+          + 'uniform float fogNoiseStrength;\n'
+          + 'uniform float uFogTime;\n'
+          + 'uniform float fogDynamic;\n'
+          + 'uniform vec2 fogFlow;\n'
+          + 'uniform float fogWarp;'
         );
         for (const line of OUTGOING_LINES) {
           if (!fragment.includes(line)) continue;
@@ -219,18 +274,36 @@ export function createFog(scene, dome = null) {
     return [
       u.fogPositionY.value, u.fogSmoothness.value, u.fogDepth.value,
       u.fogDepthSmoothness.value, u.fogEnabled.value, u.uFogColor.value.getHexString(),
+      // 动态雾的三个参数也进指纹：它们靠 uniform 传值，同样受"值变了必须换程序"的约束。
+      // uFogTime / uFogNoise 除外 —— 前者每帧都在变，进指纹等于每帧重编译；
+      // 后者是贴图句柄，运行期不动。
+      u.fogDynamic.value, u.fogNoiseStrength.value, u.fogNoiseScale.value,
+      u.fogFlow.value.x, u.fogFlow.value.y, u.fogWarp.value,
     ].join(',');
   }
 
   /** 把设置写进 uniform（值变了就强制重编译，原因见 stateKey()） */
   function bindUniforms(s) {
+    const u = uniforms;
     const before = stateKey();
-    uniforms.uFogColor.value.set(s.color);
-    uniforms.fogPositionY.value = s.height;
-    uniforms.fogSmoothness.value = s.smoothness;
-    uniforms.fogDepth.value = s.depth;
-    uniforms.fogDepthSmoothness.value = s.depthSmoothness;
-    uniforms.fogEnabled.value = s.enabled ? 1 : 0;
+    if (s.noiseTexture) noise = s.noiseTexture;
+    if (u.uFogNoise.value !== noise) u.uFogNoise.value = noise;
+    u.uFogColor.value.set(s.color);
+    u.fogPositionY.value = s.height;
+    u.fogSmoothness.value = s.smoothness;
+    u.fogDepth.value = s.depth;
+    u.fogDepthSmoothness.value = s.depthSmoothness;
+    u.fogEnabled.value = s.enabled ? 1 : 0;
+    u.fogNoiseStrength.value = s.noiseStrength;
+    u.fogNoiseScale.value = s.noiseScale;
+    u.fogDynamic.value = s.dynamic ? 1 : 0;
+    u.fogFlow.value.set(s.flowX, s.flowY);
+    u.fogWarp.value = s.warp;
+    // 贴图句柄也进指纹：换了贴图必须重编译，否则 sampler 还指着旧的那张
+    if (u.uFogNoise.value !== noise) {
+      u.uFogNoise.value = noise;
+      for (const material of injected.keys()) material.needsUpdate = true;
+    }
     // 值有任何变化都要让已注入的材质重编译 —— 否则 three 不会把新值传上去
     if (stateKey() !== before) {
       for (const material of injected.keys()) material.needsUpdate = true;
@@ -263,6 +336,7 @@ export function createFog(scene, dome = null) {
      */
     update(settings, parts = []) {
       const s = resolve(settings);
+      if (s.noiseTexture) noise = s.noiseTexture;
       // 背景三选一。'dome' 交给渐变天穹（与雾同一分界），此时**必须把 scene.background 置空**，
       // 否则背景色会把天穹整个盖住。曾把纯色背景写成雾色，白雾连背景一起刷白 —— 两者独立。
       if (s.bgMode === 'dome') {
@@ -290,6 +364,22 @@ export function createFog(scene, dome = null) {
       bindUniforms(resolve(settings));
       return true;
     },
+    /**
+     * 推进流动时间。**每帧调用**，只是改 uniform 的值 —— 不进 cacheKey，所以不会重编译。
+     * 关掉动态时也照常累加：重新打开时不该从 0 跳一下。
+     * @param {number} dt 秒
+     */
+    tick(dt) {
+      if (!Number.isFinite(dt) || dt <= 0) return;
+      // 取模避免长时间运行后浮点精度下降（噪声 UV 本来就能平铺，模掉不改变画面）
+      uniforms.uFogTime.value = (uniforms.uFogTime.value + dt) % 3600;
+    },
+    /** 把流动时间归零（演出里"回到起始状态"用） */
+    resetTime() {
+      uniforms.uFogTime.value = 0;
+    },
+    /** 当前流动时间，供测试与调试读取 */
+    get time() { return uniforms.uFogTime.value; },
     dispose() {
       detach();
       gradient.dispose();

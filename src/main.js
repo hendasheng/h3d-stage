@@ -11,6 +11,7 @@ import { render, h } from 'preact';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createEnvironmentLighting } from './environment.js';
 import { createFog } from './fog.js';
+import { getFogNoiseTexture } from './fog-texture.js';
 import { createSkyDome } from './sky-dome.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -62,6 +63,7 @@ let classMaterials = new Map();   // class 编号 → 该 class 的材质列表�
 // 注意：必须在使用前声明 —— signal.subscribe() 会立刻同步触发回调，
 // 若声明写在后面会命中暂时性死区（TDZ）直接抛错。
 let lastExplode = 0;
+let lastFrameTime = 0;   // 上一帧时间戳（ms），用来算动态雾的 dt
 // 模型就绪前忽略 UI 触发的重建，否则 subscribe 的立即回调会拿着空场景去拆部件
 let ready = false;
 
@@ -288,8 +290,8 @@ function initThree() {
   skyDome = createSkyDome();
   scene.add(skyDome.dome);
 
-  // 雾（材质注入）
-  fog = createFog(scene, skyDome);
+  // 雾（材质注入）+ 动态雾用的无缝噪声贴图
+  fog = createFog(scene, skyDome, getFogNoiseTexture());
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
@@ -347,11 +349,18 @@ function initThree() {
   renderer.setAnimationLoop(tick);
 }
 
-function tick() {
+function tick(now = 0) {
   if (store.spin.value && modelRoot) modelRoot.rotation.y += 0.0025;
   controls.update();
   // 天穹每帧跟随相机：半径远小于远裁剪面，不跟随就会"走出天空"
   skyDome?.followCamera(camera);
+
+  // 动态雾：用真实经过的时间推进流动，与帧率无关。
+  // 首帧没有上一帧时间戳（now 可能是 0），跳过以免产生一个巨大的 dt。
+  if (lastFrameTime && now > lastFrameTime) {
+    fog?.tick(Math.min((now - lastFrameTime) / 1000, 0.1));   // 封顶 0.1s：切标签页回来不要跳一大步
+  }
+  lastFrameTime = now;
   let needRender = true;
 
   // 只要曾经炸开过就继续调用 —— 包括 factor 归零那一帧，
@@ -500,7 +509,9 @@ function initControlsWiring() {
   const applyFog = () => applyFogCurrent();
   for (const sig of [store.fogEnabled, store.fogColor, store.fogBgMode,
     store.fogBgColor, store.fogBgTop, store.fogBgBottom,
-    store.fogHeight, store.fogSmoothness, store.fogDepth, store.fogDepthSmoothness]) {
+    store.fogHeight, store.fogSmoothness, store.fogDepth, store.fogDepthSmoothness,
+    store.fogDynamic, store.fogNoiseStrength, store.fogNoiseScale,
+    store.fogFlowX, store.fogFlowY, store.fogWarp]) {
     sig.subscribe(applyFog);
   }
   // subscribe 的回调会立即同步执行一次；模型没加载完之前不要真的重建
@@ -597,6 +608,13 @@ function applyFogCurrent() {
     smoothness: store.fogSmoothness.value,
     depth: store.fogDepth.value,
     depthSmoothness: store.fogDepthSmoothness.value,
+    // 动态雾（0.5）
+    dynamic: store.fogDynamic.value,
+    noiseStrength: store.fogNoiseStrength.value,
+    noiseScale: store.fogNoiseScale.value,
+    flowX: store.fogFlowX.value,
+    flowY: store.fogFlowY.value,
+    warp: store.fogWarp.value,
   }, targets);
 }
 

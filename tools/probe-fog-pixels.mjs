@@ -136,9 +136,13 @@ try {
       const setPlate = (d, s) => {
         plate.position.z = -d;
         plate.scale.set(d * 1.2, d * 1.2, 1);   // 铺满视野
+        // 第一段验的是**静态公式**，所以默认把动态关掉：
+        // 开了噪声之后雾面高度会被随机推动，每次渲染都不一样，这些断言的期望值就不成立了。
+        // 动态另有第三段专门验。
         // 背景用纯黑、与板不同色：板没盖到的地方一眼能看出来，不会有"板其实是背景"的误会
         fogA.update({ color: '#ffffff', bgMode: 'flat', bgColor: '#000000',
-          height: 40, smoothness: 2, depth: 100, depthSmoothness: 5, ...s }, [{ material: plateMat }]);
+          height: 40, smoothness: 2, depth: 100, depthSmoothness: 5, dynamic: false, ...s },
+        [{ material: plateMat }]);
       };
       const shotA = (label) => {
         renderer.render(sceneA, cameraA);
@@ -215,8 +219,117 @@ try {
 
       DIAG.push('FOG_DEFAULTS=' + JSON.stringify(FOG_DEFAULTS));
 
+      /* ================= 第三段：动态雾（噪声） ================= */
+      // 先造一张程序生成的噪声贴图当 uFogNoise。
+      // 刻意**不用**仓库里那张真图：探针要验证的是"噪声参与了运算、时间推进会改变画面"，
+      // 用的噪声长什么样无关紧要；自己造反而更可控（不依赖图片加载）。
+      const noiseCanvas = document.createElement('canvas');
+      noiseCanvas.width = 64;
+      noiseCanvas.height = 64;
+      {
+        const ctx = noiseCanvas.getContext('2d');
+        const img = ctx.createImageData(64, 64);
+        let seed = 12345;
+        const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+        // 随机低频斑块 + 抖动，够"有起伏"即可
+        for (let y = 0; y < 64; y++) {
+          for (let x = 0; x < 64; x++) {
+            const gx = Math.floor(x / 8);
+            const gy = Math.floor(y / 8);
+            const base = ((gx * 73 + gy * 151) % 97) / 97;
+            const v = Math.round(Math.min(1, Math.max(0, base * 0.75 + rnd() * 0.25)) * 255);
+            const o = (y * 64 + x) * 4;
+            img.data[o] = v; img.data[o + 1] = v; img.data[o + 2] = v; img.data[o + 3] = 255;
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+      }
+      const noiseTex = new THREE.CanvasTexture(noiseCanvas);
+      noiseTex.wrapS = THREE.RepeatWrapping;
+      noiseTex.wrapT = THREE.RepeatWrapping;
+      noiseTex.generateMipmaps = false;
+      noiseTex.minFilter = THREE.LinearFilter;
+
+      // **尺寸按真实模型来**：模型只有约 16 个世界单位高，而高度过渡带本身就有 10 个宽，
+      // 也就是说模型几乎整片都落在过渡带里 —— 所以很小的起伏强度就能明显改变画面。
+      // （踩过：这里先用了一块 ±28 的满屏大板，过渡带只占它 18%，于是 0.35 的强度看起来"没反应"，
+      //   我差点误判成噪声没生效。）
+      const sceneC = new THREE.Scene();
+      const cameraC = new THREE.PerspectiveCamera(50, 1, 0.1, 2000);
+      cameraC.position.set(0, 0, 0);
+      cameraC.lookAt(0, 0, -1);
+      const dynMat = new THREE.MeshBasicMaterial({ color: 0x505050 });
+      const dynPlate = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), dynMat);
+      dynPlate.position.z = -40;
+      dynPlate.scale.set(18, 16, 1);   // ≈ 真实模型的尺寸
+      sceneC.add(dynPlate);
+      const fogC = createFog(sceneC, null, noiseTex);
+
+      const C_BASE = { color: '#ffffff', bgMode: 'flat', bgColor: '#000000',
+        height: -2, smoothness: 5, depth: 2000, depthSmoothness: 5,
+        dynamic: true, noiseStrength: 6, noiseScale: 0.06, flowX: 0.012, flowY: 0.007, warp: 0.35 };
+
+      const frameC = new Uint8Array(W * H * 4);
+      /**
+       * 与参考帧的差异。**只看均值会被饱和像素骗过去**：雾的大片区域要么全黑要么全白，
+       * 噪声只让"雾界线"那一带迁移，均值变化微乎其微（实测 0.12/255）。
+       * 所以同时统计"变化超过 8 级的像素数"——这个对边界迁移非常敏感。
+       */
+      const diffStats = (ref) => {
+        let sum = 0, n = 0, changed = 0;
+        for (let y = 4; y < H - 4; y++) for (let x = 4; x < W - 4; x++) {
+          const d = Math.abs(buf[(y * W + x) * 4] - ref[(y * W + x) * 4]);
+          sum += d; n++;
+          if (d > 8) changed++;
+        }
+        return { mean: +(sum / n).toFixed(2), changed, total: n };
+      };
+      /** 渲染一帧并返回"与上一帧的差异" */
+      const shotC = (label, over) => {
+        const prev = frameC.slice();
+        fogC.update({ ...C_BASE, ...over }, [{ material: dynMat }]);
+        renderer.render(sceneC, cameraC);
+        gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+        frameC.set(buf);
+        let sum = 0, n = 0;
+        for (let y = 4; y < H - 4; y++) for (let x = 4; x < W - 4; x++) { sum += buf[(y * W + x) * 4]; n++; }
+        OUT.push({ seg: 'C', label, val: +(sum / n).toFixed(2) });
+        return { frame: frameC.slice(), step: diffStats(prev) };
+      };
+
+      shotC('N0 动态雾（t=0）');
+      const dynFrame = frameC.slice();
+      // 1) 开启动态 与 关掉动态 的差异
+      shotC('N1 关掉动态', { dynamic: false });
+      const onVsOff = diffStats(dynFrame);
+      // 2) 动态下推进时间 → 画面应该改变
+      shotC('N2 动态（时间回到同一处）', { dynamic: true });
+      fogC.tick(1.0);
+      const timeStep = shotC('N3 动态 + 推进 1s', { dynamic: true }).step;
+      // 3) 关掉动态后推进时间 → 画面不该改变
+      shotC('N4 关动态（基准）', { dynamic: false });
+      fogC.tick(1.0);
+      const offStep = shotC('N5 关动态 + 推进 1s', { dynamic: false }).step;
+      // 4) 起伏强度 0 → 等价于关掉噪声
+      shotC('N6 强度 0（基准）', { dynamic: true, noiseStrength: 0 });
+      fogC.tick(1.0);
+      const flatStep = shotC('N7 强度 0 + 推进 1s', { dynamic: true, noiseStrength: 0 }).step;
+      DIAG.push('动态雾：开启动态 vs 关动态 = ' + onVsOff.mean
+        + '（变化像素 ' + onVsOff.changed + '/' + onVsOff.total + '）'
+        + '；动态下推进 1s：均值差 ' + timeStep.mean + '、变化像素 ' + timeStep.changed
+        + '；关动态后推进 1s：均值差 ' + offStep.mean + '、变化像素 ' + offStep.changed
+        + '；强度 0 后推进 1s：均值差 ' + flatStep.mean + '、变化像素 ' + flatStep.changed);
+
       renderer.dispose();
-      return JSON.stringify({ out: OUT, diag: DIAG });
+      return JSON.stringify({
+        out: OUT, diag: DIAG,
+        stats: {
+          diffOn: onVsOff.mean, changedOn: onVsOff.changed, total: onVsOff.total,
+          diffTime: timeStep.mean, changedTime: timeStep.changed,
+          diffOff: offStep.mean, changedOff: offStep.changed,
+          diffFlat: flatStep.mean, changedFlat: flatStep.changed,
+        },
+      });
     })()
   `);
 
@@ -224,12 +337,16 @@ try {
     console.log('  页面执行失败:', result);
     failures++;
   } else {
-    const { out, diag } = JSON.parse(result);
+    const { out, diag, stats } = JSON.parse(result);
     for (const d of diag ?? []) console.log('  [diag] ' + d);
     for (const r of out) {
-      console.log(r.seg === 'A'
-        ? `  ${r.label.padEnd(26)} 板色=${String(r.val).padStart(6)} 角=${String(r.corner).padStart(3)}  ${r.u}`
-        : `  ${r.label.padEnd(26)} 天上=${String(r.skyTop).padStart(6)}  天下=${String(r.skyBottom).padStart(6)} 上部RGB=${r.rgb}`);
+      if (r.seg === 'A') {
+        console.log(`  ${r.label.padEnd(26)} 板色=${String(r.val).padStart(6)} 角=${String(r.corner).padStart(3)}  ${r.u}`);
+      } else if (r.seg === 'C') {
+        console.log(`  ${r.label.padEnd(26)} 全屏均值=${String(r.val).padStart(6)}  ${r.u}`);
+      } else {
+        console.log(`  ${r.label.padEnd(26)} 天上=${String(r.skyTop).padStart(6)}  天下=${String(r.skyBottom).padStart(6)} 上部RGB=${r.rgb}`);
+      }
     }
     const g = (k) => out.find((r) => r.label.startsWith(k));
     const [P1, P2, P3, P4, P4b, P5, P6, P7, P8, P9] = ['P1', 'P2', 'P3', 'P4 ', 'P4b', 'P5', 'P6', 'P7', 'P8', 'P9'].map(g);
@@ -262,6 +379,19 @@ try {
     ok('bgTop 控制天穹顶部颜色', D5.skyTop > D1.skyTop + 100 && D5.rgb.startsWith('255/'),
       `天上 ${D1.skyTop} → ${D5.skyTop}（RGB ${D5.rgb}）`);
     ok('没有地面时，天穹自己铺满整个画面', D1.all > 5, `全屏 ${D1.all}`);
+
+    console.log('\n--- 第三段：动态雾（噪声参与运算，且时间推进会改变画面）---');
+    ok('开启动态后画面确实被噪声改变（看变化像素占比）',
+      stats.changedOn / stats.total > 0.02,
+      `变化像素 ${stats.changedOn}/${stats.total}，均值差 ${stats.diffOn}`);
+    ok('时间推进 → 画面改变（噪声在流动）', stats.changedTime > 0,
+      `变化像素 ${stats.changedTime}，均值差 ${stats.diffTime}`);
+    ok('关掉动态后，时间推进完全不改变画面',
+      stats.changedOff === 0 && stats.diffOff === 0,
+      `变化像素 ${stats.changedOff}，均值差 ${stats.diffOff}`);
+    ok('起伏强度为 0 时，时间推进也不改变画面',
+      stats.changedFlat === 0 && stats.diffFlat === 0,
+      `变化像素 ${stats.changedFlat}，均值差 ${stats.diffFlat}`);
   }
 } catch (err) {
   failures++;
