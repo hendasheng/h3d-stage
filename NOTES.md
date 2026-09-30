@@ -214,24 +214,36 @@ color = mix(color, fogColor, mixer);
 > 编译日志里没有错误（`renderer.info.programs[].diagnostics`），
 > 以及**像素真的变了**（`readPixels` 回读）。两者都做过才敢说修好了。
 
-### 深度纹理必须取自 `renderTarget1`，否则整屏爆闪（本版最惨的一次翻车）
+### 深度**不能**挂在 composer 的 render target 上：WebGL 会报反馈环
 
-`EffectComposer` 会把传进去的 render target 变成它的 `renderTarget1` / `renderTarget2` 两个缓冲，
-而**场景的深度只写进 `renderTarget1`**（`RenderPass` 写的是当时的 readBuffer，第一步就是它）。
+这是本版最费时间的一次翻车，根因是 WebGL 的一条硬限制：
 
-第一版我"顺着 readBuffer 去绑深度"，结果把一张**从未被写过**的深度纹理交给雾 pass：
-未初始化的深度纹理每帧内容不定 → 重建出的世界坐标是垃圾 → 雾量乱跳 → **整屏爆闪**。
+```
+GL_INVALID_OPERATION: glDrawArrays: Feedback loop formed between Framebuffer and active Texture
+```
 
-两条结论：
+我原本给 composer 的 render target 挂了一张 `DepthTexture` 让雾 pass 读。但雾 pass
+**输出到的那个 framebuffer，其深度附件正是它采样的那张纹理** —— 同一张图既当读源又当写目标，
+WebGL 直接丢弃这次绘制。表现就是整屏乱闪 / 雾像没生效，而且**不是参数问题、也不是版本问题**。
 
-- 深度固定取 `composer.renderTarget1.depthTexture`；并且用 getter 每帧现取，
-  因为 `EffectComposer.setSize()`（窗口缩放）会**重建**这两个 target，旧纹理随之作废。
-- 雾 pass 放在 **紧跟 RenderPass、GTAO/辉光之前**。刚渲染完那一刻深度一定新鲜，
-  与后面接多少个 pass 无关；雾是"空间里的介质"，本来就该作用在最原始的场景颜色上。
+期间我试过几种绕法，全是错的方向：
 
-另外在片元里加了硬保护：世界坐标一旦非有限就**原样输出**（宁可不加雾，也绝不把垃圾混进画面），
-`viewPos.w` 接近 0 时也夹住。这类"输出垃圾"的失败模式看起来就是爆闪，代价太大，值得多一层保险。
+- 把 `tDepth` 换绑到 `renderTarget1`（以为"场景深度只写进它"）—— 反馈环依然在；
+- 把雾 pass 挪到紧跟 RenderPass —— 依然在，因为问题不在顺序，在"读写同一张图"。
 
+**正确做法**（见 `src/fog-depth.js`）：深度来自一趟**独立的深度预渲染**。
+
+1. 用 `MeshDepthMaterial` + `RGBADepthPacking`，把深度写进一张**独立的普通 RGBA 纹理**；
+2. 换回正常材质渲染场景颜色（`scene.overrideMaterial` 临时替换）；
+3. 雾 pass 采那张独立纹理 —— 它与雾的输出 framebuffer 毫无关系，不存在反馈。
+
+用 RGBA 打包而不是深度纹理格式，是为了在着色器里直接用 three 自带的
+`unpackRGBAToDepth()`，不依赖任何深度纹理格式/扩展。精度对雾够用：
+深度只用来还原世界坐标，量化台阶远小于高度过渡带。
+
+**顺带说清一个我走过的弯路**：判断"雾有没有生效"必须看**错误日志 + 像素**，
+我在 headless 下反复用截图/`toDataURL` 取样，它们会返回过期帧，导致我多次得出错误结论
+并把它们当成"验证通过"。可靠的只有 `readRenderTargetPixels`，而且 target 尺寸必须与画布一致。
 ### 从深度重建世界坐标：矩阵必须自己传
 
 ```glsl

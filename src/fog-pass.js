@@ -1,58 +1,38 @@
 import * as THREE from 'three';
 
 /**
- * fog-pass.js —— **全局雾**：一个全屏后期 pass，用深度重建每个像素的世界坐标。
+ * fog-pass.js —— **全局雾**：着色器定义 + 相机矩阵刷新。
  *
- * 为什么不能再靠"给材质注入"（0.5 第一版的根本错误）：
- *   材质注入按定义只改**实体表面**的像素。模型和相机之间的空间没有东西可以改，
- *   所以那种做法永远只能得到"模型表面浮着一层雾"，做不出"空间里有雾"。
- *   要让雾全局生效，它必须是一个**覆盖整个画面**的 pass。
+ * ## 雾为什么必须是全屏后期，而不是给材质注入
  *
- * 顺带解决条带问题：材质注入里我只能拿到被渲染的那个面的世界坐标，
- * 在竖直面上 xz 几乎不变，噪声被沿高度拉成竖条（用户一眼就看出来了）。
- * 现在每个像素都有完整的世界坐标，噪声用**三维**采样，竖直面上自然有变化。
+ * 材质注入按定义只改**实体表面**的像素。模型和相机之间的空间没有东西可以改，
+ * 所以那种做法永远只能得到"模型表面浮着一层雾"，做不出"空间里有雾"。
  *
- * 深度重建的做法 —— **矩阵必须自己传**：
- *   viewZ  = perspectiveDepthToViewZ( texture(tDepth).x, near, far )
- *   viewPos = (uInvProjection * ndc) 归一化后把 z 换成 viewZ
- *   world   = uCameraWorld * viewPos
- *   其中 uInvProjection = camera.projectionMatrixInverse，uCameraWorld = camera.matrixWorld，
- *   由 `bindFogPassCamera()` 每帧刷新（相机一动它们就变，不刷新雾会错位）。
+ * ## 深度从哪来（**不能**用挂在 composer target 上的 DepthTexture）
  *
- * 雾的**公式与 0.4/参考站完全一致**，只是从"改材质颜色"搬到"改最终颜色"：
+ * 直觉做法是给 composer 的 render target 挂一张 `DepthTexture` 让雾读。**那会撞上硬限制**：
+ *
+ *   `GL_INVALID_OPERATION: glDrawArrays: Feedback loop formed between Framebuffer
+ *    and active Texture`
+ *
+ * 因为雾输出的那个 framebuffer，其深度附件**正是**它采样的纹理 —— 同一张图既读又写，
+ * WebGL 直接丢弃这次绘制（画面表现是"雾没生效"或整屏乱闪）。这是 API 层面禁止的，
+ * 不是参数问题。
+ *
+ * 所以深度来自 `src/fog-depth.js` 的**独立预渲染**：它把深度用 `RGBADepthPacking`
+ * 写进一张独立的普通 RGBA 纹理（与雾的输出 framebuffer 毫无关系），
+ * 这里用 three 自带的 `unpackRGBAToDepth()` 解包。
+ *
+ * ## 公式（与参考站一致，只换了作用位置）
+ *
  *   verticalMixer = smoothstep(y - smoothness, y + smoothness, positionY + noiseOffset)
- *   depthMixer    = smoothstep(d + dSmooth, d - dSmooth, depth)  然后被 verticalMixer 门控
- *   mixer         = clamp(verticalMixer*.5 + depthMixer*.95, 0, 1) * enabled
+ *   depthMixer    = smoothstep(d + dSmooth, d - dSmooth, fogDepth)，再被 verticalMixer 门控
+ *   mixer         = clamp(verticalMixer*.5 + depthMixer*.95, 0, 1)
  *   color         = mix(color, fogColor, mixer)
- */
-
-/**
- * 给一个 ShaderPass 接上"每帧刷新相机矩阵（以及深度纹理）"的能力。
  *
- * @param {object} pass three 的 ShaderPass（uniforms 用 FOG_PASS_SHADER）
- * @param {THREE.Camera} camera
- * @param {() => object} [getDepthTexture] 每帧取一次深度纹理。
- *   必须用 getter 而不是值：`EffectComposer.setSize()`（窗口缩放）会**重建**它的两个
- *   render target，旧的深度纹理随之作废，抱着旧引用会让雾读到一张死纹理。
- * @returns {{update: () => void}} 每帧调用 update()
+ * 另外加了两点参考站没有的处理：**距离衰减**与**雾量封顶**（见着色器里的注释）。
+ * 没有它们时，只要物体低于雾面，连近处表面也会被盖上 50% 白 —— 画面会糊成一片。
  */
-export function bindFogPassCamera(pass, camera, getDepthTexture) {
-  const update = () => {
-    if (!pass || !camera) return;
-    pass.uniforms.uInvProjection.value.copy(camera.projectionMatrixInverse);
-    camera.updateMatrixWorld();
-    pass.uniforms.uCameraWorld.value.copy(camera.matrixWorld);
-    pass.uniforms.cameraNear.value = camera.near;
-    pass.uniforms.cameraFar.value = camera.far;
-    if (getDepthTexture) {
-      const depth = getDepthTexture();
-      if (depth && pass.uniforms.tDepth.value !== depth) pass.uniforms.tDepth.value = depth;
-    }
-  };
-  update();
-  return { update };
-}
-
 
 export const FOG_PASS_SHADER = {
   uniforms: {
@@ -62,23 +42,22 @@ export const FOG_PASS_SHADER = {
     cameraFar: { value: 1000 },
     // **必须自己传矩阵**：`inverseProjectionMatrix` / `viewMatrixInverse` 是 three 给
     // **内建材质**注入的 uniform，自定义 ShaderMaterial 拿不到。
-    // 踩过：直接引用它们 → 片元编译失败 → 整条后期链静默失效（只在控制台留一句 shader error，
-    // 画面看起来"雾没生效"，极难查）。
+    // 踩过：直接引用它们 → 片元编译失败 → 整条后期链静默失效（只在控制台留一句 shader error）。
     uInvProjection: { value: new THREE.Matrix4() },
     uCameraWorld: { value: new THREE.Matrix4() },
     uFogColor: { value: new THREE.Color(0xffffff) },
-    fogPositionY: { value: -2 },
-    fogSmoothness: { value: 5 },
-    fogDepth: { value: 70 },
-    fogDepthSmoothness: { value: 25 },
-    uFogEnabled: { value: 1 },
+    fogPositionY: { value: 0 },
+    fogSmoothness: { value: 0 },
+    fogDepth: { value: 0 },
+    fogDepthSmoothness: { value: 0 },
+    fogEnabled: { value: 0 },
     // 雾量上限：留一点本体颜色，别把画面吃光（参考站是 1.0，实测太糊）
     uFogMaxMixer: { value: 0.85 },
     uFogNoise: { value: null },
     fogNoiseScale: { value: 0.06 },
-    fogNoiseStrength: { value: 6 },
+    fogNoiseStrength: { value: 0 },
     uFogTime: { value: 0 },
-    uFogDynamic: { value: 1 },
+    uFogDynamic: { value: 0 },
     fogFlow: { value: new THREE.Vector2(0.012, 0.007) },
     fogFlowZ: { value: 0.006 },
     fogWarp: { value: 0.35 },
@@ -91,11 +70,11 @@ export const FOG_PASS_SHADER = {
     }`,
   fragmentShader: `
     #include <common>
+    #include <packing>
     uniform sampler2D tDiffuse;
     uniform sampler2D tDepth;
     uniform float cameraNear;
     uniform float cameraFar;
-    // ShaderPass 用的是一张普通 quad，three 不会给自定义材质注入这两个矩阵 —— 必须自己声明并传入。
     uniform mat4 uInvProjection;
     uniform mat4 uCameraWorld;
     uniform vec3 uFogColor;
@@ -103,7 +82,7 @@ export const FOG_PASS_SHADER = {
     uniform float fogSmoothness;
     uniform float fogDepth;
     uniform float fogDepthSmoothness;
-    uniform float uFogEnabled;
+    uniform float fogEnabled;
     uniform float uFogMaxMixer;
     uniform sampler2D uFogNoise;
     uniform float fogNoiseScale;
@@ -115,20 +94,14 @@ export const FOG_PASS_SHADER = {
     uniform float fogWarp;
     varying vec2 vUv;
 
-    float perspectiveDepthToViewZ(const in float invClipZ, const in float near, const in float far) {
-      return (near * far) / ((far - near) * invClipZ - far);
-    }
-
     /**
      * 三维噪声：在一张二维无缝贴图的两个"层"之间做三线性插值。
-     * p 是已经乘过缩放的噪声坐标。
-     * 每层在自己的 UV 空间里平铺（贴图本身无缝），层间按 z 的小数部分混合，
-     * 于是任意方向上都有连续变化 —— 竖直面不会退化成一条一条。
+     * 每层在自己的 UV 空间里平铺（贴图本身无缝），层间按 z 的小数部分混合。
+     * 这样不需要 3D 纹理，却是货真价实的三维噪声 —— 竖直面上不会被拉成条。
      */
     float noiseVolume(vec3 p) {
       float z0 = floor(p.z);
       float fz = p.z - z0;
-      // 每层给一个固定的 UV 偏移，避免两层采到同一条轨迹
       vec2 o0 = vec2(z0 * 0.137, z0 * 0.317);
       vec2 o1 = vec2((z0 + 1.0) * 0.137, (z0 + 1.0) * 0.317);
       float a = texture2D(uFogNoise, p.xy + o0).r;
@@ -139,18 +112,22 @@ export const FOG_PASS_SHADER = {
     void main() {
       vec4 color = texture2D(tDiffuse, vUv);
 
-      // 世界坐标：深度 + 逆投影 + 视图矩阵的逆
-      float d = texture2D(tDepth, vUv).x;
-      float viewZ = perspectiveDepthToViewZ(d, cameraNear, cameraFar);
+      // 深度是**独立预渲染**写进普通 RGBA 纹理的（RGBADepthPacking）→ 解包
+      float packed = texture2D(tDepth, vUv).r;
+      float rawDepth = unpackRGBAToDepth(texture2D(tDepth, vUv));
+      // 背景没写深度（clear 到 1）→ 当作"无限远"，这样背景/天穹也参与雾
+      float viewZ = (rawDepth >= 1.0 - 1e-6)
+        ? -cameraFar
+        : perspectiveDepthToViewZ(rawDepth, cameraNear, cameraFar);
       vec4 ndc = vec4(vUv * 2.0 - 1.0, 0.0, 1.0);
       vec4 viewPos = uInvProjection * ndc;
-      // 逆投影在 z=远平面处会退化（w 为 0），指数超大。夹住，别让后面算出 Inf/NaN。
+      // 逆投影在 z=远平面处退化（w→0）。夹住，别让后面算出 Inf/NaN。
       viewPos /= (abs(viewPos.w) < 1e-6 ? (viewPos.w < 0.0 ? -1e-6 : 1e-6) : viewPos.w);
       viewPos.z = viewZ;
       vec3 world = (uCameraWorld * vec4(viewPos.xyz, 1.0)).xyz;
-      // 硬保护：世界坐标一旦非有限（深度纹理异常、矩阵未更新等），直接原样输出。
-      // 宁可不加雾，也绝不能把垃圾值混进画面 —— 那种情况看起来就是整屏爆闪。
-      if (!all(lessThan(abs(world), vec3(1e7)))) {
+      // 硬保护：世界坐标一旦非有限就原样输出。
+      // 输出垃圾这种失败模式看起来就是整屏乱闪，代价太大，值得多一层保险。
+      if (!all(lessThan(abs(world), vec3(1e7))) || !(packed >= 0.0)) {
         gl_FragColor = color;
         return;
       }
@@ -167,15 +144,39 @@ export const FOG_PASS_SHADER = {
       depthMixer = mix(0.0, depthMixer, verticalMixer);
       float mixer = clamp(verticalMixer * 0.5 + depthMixer * 0.95, 0.0, 1.0);
 
-      // **距离衰减**：参考站的公式里高度项是恒定的，于是只要物体低于雾面，
-      // 连近处的表面也会被盖上 50% 白 —— 整幅画面糊成一片，看不出雾的层次。
-      // 让它按到相机的距离渐入：近处几乎不受影响，越远越浓。
+      // 距离衰减：参考站的高度项是恒定的，照搬会让近处表面也被盖上 50% 白 → 糊成一片
       float nearFade = smoothstep(0.0, max(fogDepth, 1.0), distanceToCamera);
       mixer *= nearFade;
-      // 再封个顶：留一点本体颜色，雾不该把画面吃光。
-      mixer = min(mixer, uFogMaxMixer) * uFogEnabled;
+      mixer = min(mixer, uFogMaxMixer) * fogEnabled;
       if (!(mixer >= 0.0)) mixer = 0.0;
 
       gl_FragColor = vec4(mix(color.rgb, uFogColor, mixer), color.a);
     }`,
 };
+
+/**
+ * 给一个使用 `FOG_PASS_SHADER` 的材质接上"每帧刷新相机矩阵与深度纹理"的能力。
+ *
+ * @param {THREE.ShaderMaterial} material
+ * @param {THREE.Camera} camera
+ * @param {() => object} [getDepthTexture] 每帧取一次深度纹理。
+ *   必须用 getter 而不是值：窗口缩放会重建 render target，旧纹理随之作废。
+ * @returns {{update: () => void}}
+ */
+export function bindFogCamera(material, camera, getDepthTexture) {
+  const update = () => {
+    if (!material || !camera) return;
+    const u = material.uniforms;
+    if (u.uInvProjection) u.uInvProjection.value.copy(camera.projectionMatrixInverse);
+    camera.updateMatrixWorld();
+    if (u.uCameraWorld) u.uCameraWorld.value.copy(camera.matrixWorld);
+    if (u.cameraNear) u.cameraNear.value = camera.near;
+    if (u.cameraFar) u.cameraFar.value = camera.far;
+    if (getDepthTexture && u.tDepth) {
+      const depth = getDepthTexture();
+      if (depth && u.tDepth.value !== depth) u.tDepth.value = depth;
+    }
+  };
+  update();
+  return { update };
+}

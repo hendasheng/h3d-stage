@@ -43,7 +43,8 @@
 
 | 现象 | 根因 |
 | --- | --- |
-| **整屏爆闪**（改坏了画面） | 雾 pass 的深度纹理绑到了 `composer.renderTarget2`，而场景的深度**只写进 `renderTarget1`** → 雾读到一张从未被写过的深度纹理，每帧内容是未初始化显存 → 重建出的世界坐标是垃圾 → 雾量乱跳。已改为固定取 `renderTarget1.depthTexture`（getter 每帧现取，兼容窗口缩放重建 target），并把雾 pass 挪到紧跟 RenderPass 的位置 |
+| **整屏乱闪 / 雾像没生效，控制台刷 `GL_INVALID_OPERATION: Feedback loop formed between Framebuffer and active Texture`** | 我把深度纹理挂在 composer 的 render target 上让雾读，而雾**输出到的正是那个 framebuffer** —— 同一张图既读又写，WebGL 直接丢弃这次绘制。改成 `src/fog-depth.js` 的**独立深度预渲染**（`MeshDepthMaterial` + `RGBADepthPacking` 写进一张独立 RGBA 纹理，着色器用 `unpackRGBAToDepth()` 解包），读写不再同源。这是 API 层面的硬限制，不是参数问题 |
+| 期间误判：把 `tDepth` 换绑到 `renderTarget1`、把雾 pass 挪到紧跟 RenderPass | 都没解决问题，因为根因不是"绑哪个 buffer / 放在第几个"，而是"读写同一张纹理"。错的方向上耗了很多轮 |
 | **雾只在模型表面，空间里没有雾**（用户指出） | 架构选错了：材质注入改不了"没有几何的像素"。改成全屏后期 pass |
 | **2D 噪声被拉伸成一条一条的竖条**（用户指出） | 沿世界 `xz` 平面采样，竖直面上 `xz` 几乎不变、只有 y 在变，而 `xz` 里没有 y。改成三维采样 |
 | 雾整段静默失效，画面看起来就是"没生效" | 片元里引用了 `inverseProjectionMatrix` / `viewMatrixInverse`——那是 three 给**内建材质**注入的 uniform，自定义 `ShaderMaterial` 拿不到 → 编译失败。现在自己声明 `uInvProjection` / `uCameraWorld` 并手动传入 |

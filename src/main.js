@@ -11,7 +11,8 @@ import { render, h } from 'preact';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createEnvironmentLighting } from './environment.js';
 import { createFog, FOG_DEFAULTS } from './fog.js';
-import { FOG_PASS_SHADER, bindFogPassCamera } from './fog-pass.js';
+import { FOG_PASS_SHADER, bindFogCamera } from './fog-pass.js';
+import { createFogDepthPass } from './fog-depth.js';
 import { getFogNoiseTexture } from './fog-texture.js';
 import { createSkyDome } from './sky-dome.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -50,7 +51,7 @@ const GRID_SIZE = 40;       // 世界网格边长（同时作为格数 → 每�
 let renderer, scene, camera, controls, modelRoot, centerGroup, raycaster, worldGrid;
 let keyLight;
 let environmentLighting;
-let composer, bloomPass, gtaoPass, fogPass, fogCamera;
+let composer, bloomPass, gtaoPass, fogPass, fogCamera, fogDepthPass;
 let fog;   // 由 createFog(scene, skyDome) 创建，见 src/fog.js
 let skyDome;   // 渐变天穹（背景），见 src/sky-dome.js
 const auxiliaryLights = [];
@@ -341,57 +342,28 @@ function initThree() {
 
   // 标准场景后期：先在 HDR 中生成辉光，最后统一做色调映射与颜色空间转换。
   //
-  // 雾走**全屏后期**（不是材质注入）：它需要场景深度来重建每个像素的世界坐标，
-  // 所以 composer 的 render target 挂一张深度纹理（RenderPass 写、雾 pass 读）。
+  // 雾走**全屏后期**（不是材质注入）：它需要场景深度来重建每个像素的世界坐标。
   //
-  // **顺序：雾紧跟 RenderPass，在 GTAO / 辉光之前。** 这不是审美选择，是正确性：
-  //   1. 刚渲染完那一刻深度一定是新鲜的 —— 与后面接多少个 pass 无关，
-  //      不会出现"某个 pass 顺手把深度缓冲清掉/换掉"这类难查的问题；
-  //   2. 雾是"空间里的介质"，本来就该作用在最原始的场景颜色上，
-  //      再让 GTAO（接触遮蔽）与辉光去处理雾化后的画面。
+  // **深度必须来自独立的预渲染**（见 src/fog-depth.js）。曾试着给 composer 的 render
+  // target 挂一张 `DepthTexture` 让雾读，结果撞上 WebGL 的硬限制：
+  //   `GL_INVALID_OPERATION: Feedback loop formed between Framebuffer and active Texture`
+  // 因为雾输出的那个 framebuffer，其深度附件正是它采样的纹理。这不是参数问题，
+  // 是 API 禁止的，那次绘制会被直接丢弃（画面就是"雾没生效/整屏乱闪"）。
   //
-  // **踩过并改坏过画面的坑**：`EffectComposer` 会把我传进去的 render target 变成它的
-  // renderTarget1 / renderTarget2 两个缓冲，而场景**只写进 renderTarget1 的深度**
-  // （RenderPass 写的是当时的 readBuffer，第一步就是 renderTarget1）。
-  // 第一版我照着 readBuffer 去绑，结果把一张**从未写过**的深度纹理交给雾：
-  // 未初始化的深度每帧内容不定 → 重建出的世界坐标是垃圾 → 雾量乱跳 → **整屏爆闪**。
-  const composerTarget = new THREE.WebGLRenderTarget(innerWidth, innerHeight, {
-    depthBuffer: true,
-    depthTexture: new THREE.DepthTexture(innerWidth, innerHeight),
-  });
-  composerTarget.depthTexture.format = THREE.DepthFormat;
-  composerTarget.depthTexture.type = THREE.UnsignedShortType;
-  composer = new EffectComposer(renderer, composerTarget);
+  // 顺序：深度预渲染 → RenderPass → 雾 → GTAO → 辉光 → OutputPass。
+  // 雾紧跟场景颜色之后，读到的是刚渲染完的颜色；深度来自那趟独立预渲染。
+  const search = typeof location !== 'undefined' ? (location.search ?? '') : '';
+  const noFogPass = new URLSearchParams(search).has('nofog');   // 逃生开关，见下
+
+  composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
 
-  // 逃生开关：`?nofog` 时**完全不建雾 pass**，后期链回到加雾之前的样子。
-  // 排查"画面异常到底是不是雾造成的"用这个，一次就能分开，不用来回猜。
-  // `location` 在 Node（`test:explode` 会 import 本模块）里不存在，所以判一下。
-  const search = typeof location !== 'undefined' ? (location.search ?? '') : '';
-  const noFogPass = new URLSearchParams(search).has('nofog');
-
-  fogPass = noFogPass ? null : new ShaderPass(FOG_PASS_SHADER);
-  /**
-   * 取"场景深度"那张纹理。
-   * 用 getter 而不是固定值：`EffectComposer.setSize()`（窗口缩放）会**重建**这两个 target，
-   * 旧纹理随之作废，抱着旧引用会让雾读到一张死纹理。
-   */
-  const sceneDepthTexture = () => {
-    const rt = composer?.renderTarget1;
-    if (!rt) return null;
-    if (!rt.depthTexture) {
-      // 理论上不会发生（我们建 target 时就挂了），但真发生了要出声，不要静默出垃圾画面
-      rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height);
-      rt.depthTexture.format = THREE.DepthFormat;
-      rt.depthTexture.type = THREE.UnsignedShortType;
-      console.warn('[fog] renderTarget1 上没有深度纹理，已补一张');
-    }
-    return rt.depthTexture;
-  };
-  if (fogPass) {
-    fogPass.uniforms.tDepth.value = sceneDepthTexture();
+  if (!noFogPass) {
+    fogDepthPass = createFogDepthPass(innerWidth, innerHeight);
+    fogPass = new ShaderPass(FOG_PASS_SHADER);
+    fogPass.uniforms.tDepth.value = fogDepthPass.texture;
     // 相机矩阵必须自己传（ShaderMaterial 拿不到 three 的内建矩阵），并且每帧刷新
-    fogCamera = bindFogPassCamera(fogPass, camera, sceneDepthTexture);
+    fogCamera = bindFogCamera(fogPass.material, camera, () => fogDepthPass?.texture);
     composer.addPass(fogPass);
   }
 
@@ -418,6 +390,7 @@ function initThree() {
     renderer.setSize(innerWidth, innerHeight);
     composer.setSize(innerWidth, innerHeight);
     gtaoPass.setSize(innerWidth, innerHeight);
+    fogDepthPass?.setSize(innerWidth, innerHeight);
   });
   renderer.domElement.addEventListener('pointerdown', onPointerDown);
   renderer.domElement.addEventListener('pointermove', onPointerMove);
@@ -451,6 +424,10 @@ function tick(now = 0) {
   if (glowActiveCount()) updateGlow();
 
   if (needRender) {
+    // 深度预渲染必须在场景颜色**之前**跑：它把深度写进一张独立的纹理，
+    // 雾 pass 之后采它 —— 两者不在同一个 framebuffer 上，才不会触发
+    // WebGL 的 "feedback loop between framebuffer and active texture"。
+    if (fogDepthPass && store.fogEnabled.value) fogDepthPass.render(renderer, scene, camera);
     if (store.bloomEnabled.value) composer.render();
     else renderer.render(scene, camera);
   }

@@ -48,7 +48,7 @@ function makeFakePass() {
       fogSmoothness: { value: 0 },
       fogDepth: { value: 0 },
       fogDepthSmoothness: { value: 0 },
-      uFogEnabled: { value: 0 },
+      fogEnabled: { value: 0 },
       uFogNoise: { value: null },
       fogNoiseScale: { value: 0 },
       fogNoiseStrength: { value: 0 },
@@ -88,7 +88,7 @@ ok('fogSmoothness 写对了', pass.uniforms.fogSmoothness.value === 3, String(pa
 ok('fogDepth 写对了', pass.uniforms.fogDepth.value === 90, String(pass.uniforms.fogDepth.value));
 ok('fogDepthSmoothness 写对了', pass.uniforms.fogDepthSmoothness.value === 12, String(pass.uniforms.fogDepthSmoothness.value));
 ok('uFogColor 写对了', hex(pass.uniforms.uFogColor.value) === 'ff0000', hex(pass.uniforms.uFogColor.value));
-ok('uFogEnabled = 1', pass.uniforms.uFogEnabled.value === 1, String(pass.uniforms.uFogEnabled.value));
+ok('fogEnabled = 1', pass.uniforms.fogEnabled.value === 1, String(pass.uniforms.fogEnabled.value));
 ok('动态参数一并写入（强度 / 疏密 / 流动 / warp）',
   pass.uniforms.fogNoiseStrength.value === FOG_DEFAULTS.noiseStrength
   && pass.uniforms.fogNoiseScale.value === FOG_DEFAULTS.noiseScale
@@ -98,7 +98,7 @@ ok('动态参数一并写入（强度 / 疏密 / 流动 / warp）',
   && pass.uniforms.fogWarp.value === FOG_DEFAULTS.warp,
   `str=${pass.uniforms.fogNoiseStrength.value} scl=${pass.uniforms.fogNoiseScale.value} flowZ=${pass.uniforms.fogFlowZ.value}`);
 fog.update({ enabled: false });
-ok('关雾时 uFogEnabled = 0', pass.uniforms.uFogEnabled.value === 0, String(pass.uniforms.uFogEnabled.value));
+ok('关雾时 fogEnabled = 0', pass.uniforms.fogEnabled.value === 0, String(pass.uniforms.fogEnabled.value));
 
 console.log('\n=== 3. 多次 update 不重复、可覆盖 ===');
 fog.update({ height: 7 });

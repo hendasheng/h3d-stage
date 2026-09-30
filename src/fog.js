@@ -141,7 +141,7 @@ export function createFog(scene, dome = null, pass = null, camera = null) {
     u.fogSmoothness.value = settings.smoothness;
     u.fogDepth.value = settings.depth;
     u.fogDepthSmoothness.value = settings.depthSmoothness;
-    u.uFogEnabled.value = settings.enabled ? 1 : 0;
+    u.fogEnabled.value = settings.enabled ? 1 : 0;
     u.fogNoiseScale.value = settings.noiseScale;
     u.fogNoiseStrength.value = settings.noiseStrength;
     u.uFogDynamic.value = settings.dynamic ? 1 : 0;
