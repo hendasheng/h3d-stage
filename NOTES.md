@@ -158,111 +158,112 @@ ACES 在高强度下会使颜色趋向白色；把乘法挪到 CPU 无法解决�
 Three 默认颜色管理启用，材质存储的是线性值（`#ff8800` 的 G ≈ 0.246）。
 材质数值测试只能验证传值与归零，过曝程度仍需浏览器画面确认。
 
-## 雾：参考站公式与材质注入的五个陷阱
+## 雾：为什么必须是**全局后期 pass**（0.5 的架构结论）
 
-参考效果：`projects.thibautfoussard.com/fog`。它的实现是**材质注入**（不是 three 内置雾、不是后期），
-公式用 CDP 拦截 `WebGL2RenderingContext.shaderSource` 抓原文得到：
+参考效果：`projects.thibautfoussard.com/fog`（同一作者的另一篇 Codrops 文章《The Sleepers》讲了它的做法）。
+公式是用 CDP 拦截 `WebGL2RenderingContext.shaderSource` 抓原文得到的：
 
 ```glsl
-float verticalMixer = smoothstep(vWorldPosition.y - fogSmoothness, vWorldPosition.y + fogSmoothness, fogPositionY);
-float distanceToCamera = length(vWorldPosition - cameraPosition);
+float verticalMixer = smoothstep(y - fogSmoothness, y + fogSmoothness, fogPositionY);
+float distanceToCamera = length(worldPos - cameraPosition);
 float depthMixer = smoothstep(distanceToCamera + fogDepthSmoothness, distanceToCamera - fogDepthSmoothness, fogDepth);
 depthMixer = mix(0., depthMixer, verticalMixer);          // 深度项被高度项门控
 float mixer = verticalMixer * .5 + depthMixer * .95;      // 相加加权，不是二选一
 mixer = clamp(mixer, 0., 1.);
-outgoingLight = mix(outgoingLight, vec3(1.), mixer);      // 参考站混纯白
+color = mix(color, fogColor, mixer);
 ```
 
 三条与直觉相反的结论，写断言前必须先想清楚：
 
 - **两项是相加加权**（`*.5 + *.95`），不是 `mix(高度, 深度, k)`。所以 `verticalMixer=1` 且
   `depthMixer=0` 时画面**已经**有 0.5 的雾量；两者同时饱和会被 `clamp` 到 1。
-- **深度项被高度项门控**：`verticalMixer=0` 的地方（画面整体高于雾面）两项一起归零，
-  这时怎么调 `fogDepth` 都不会有雾。反过来 `verticalMixer=1` 的地方，`fogDepth` 才说了算。
+- **深度项被高度项门控**：画面整体高于雾面时两项一起归零，这时怎么调 `fogDepth` 都没有雾。
 - **没有"距离雾/高度分层雾"两种模式**，四个参数始终同时生效。自创模式是早先走错的路。
 
-我们的两点改动：混 `uFogColor`（默认纯白，默认画面与参考站一致）而不是写死 `vec3(1.)`；
-混入量乘 `fogEnabled` 以便关断。
+### 参考站用材质注入，我们不能照搬 —— 这是 0.5 返工的根本原因
 
-### 陷阱一：`outgoingLight` 的合成行每种材质都不一样
+参考站（以及本项目 0.4 / 0.5 第一版）的做法是 `onBeforeCompile` 改每个材质的 `outgoingLight`。
+这条路能做出来，但有一个**绕不过去的性质**：
 
-给材质注入雾，必须改 `outgoingLight`，但这一行的写法**按材质类型分家**：
+> 材质注入只改**实体表面**的像素。模型和相机之间的空间没有东西可以改。
 
-| 材质 | 合成行 |
-| --- | --- |
-| Standard / Physical | `vec3 outgoingLight = totalDiffuse + totalSpecular + totalEmissiveRadiance;` |
-| Basic | `vec3 outgoingLight = reflectedLight.indirectDiffuse;` |
-| Lambert / Toon | `vec3 outgoingLight = reflectedLight.directDiffuse + reflectedLight.indirectDiffuse + totalEmissiveRadiance;` |
-| Phong | `…directDiffuse + indirectDiffuse + directSpecular + indirectSpecular + totalEmissiveRadiance;` |
-| Matcap | `vec3 outgoingLight = diffuseColor.rgb * matcapColor.rgb;` |
-| Points / Sprite / Line | `outgoingLight = diffuseColor.rgb;` |
+所以它永远只能得到"模型表面浮着一层雾"，做不出"空间里有雾"。用户一眼就看出来了。
+要让雾全局生效，它必须是一个**覆盖整个画面**的 pass。现在雾就是这样：
 
-只认第一种（PBR）时，**其它材质的雾是静默消失的**：注入函数被调用了、uniform 也挂上了、
-`customProgramCacheKey` 也变了，唯独那行代码没插进去。表现就是"链路全对、画面一动不动"。
-对策：全部列出，并且在一处都没命中时 `console.error` 报出材质类型，不许静默。
+- `src/fog-pass.js`：一个 `ShaderPass`，用**深度纹理**重建每个像素的世界坐标，
+  然后按上面的公式混合最终颜色。
+- `main.js` 给 `EffectComposer` 的 render target 挂一张 `DepthTexture`（RenderPass 写、雾 pass 读），
+  雾 pass 插在**辉光之后、色调映射之前**（这样雾色与场景一同过 `OutputPass`，颜色才一致）。
+- `src/fog.js` 只负责背景（天穹/纯色/渐变）、参数解析，把参数写进 pass 的 uniforms。
 
-### 陷阱二：varying 名不能照抄，参考站的名字在 three 里已被占用
+副产品：**0.4 那套"改了 uniform 但上传不上去"的坑自动消失了**。全屏 pass 每帧都重读 uniform，
+不需要换 `customProgramCacheKey`、也不需要重编译。动态雾同样受益。
 
-参考站的 varying 叫 `vWorldPosition`，但 three 的顶点着色器在 `ENV_WORLDPOS` 分支里
-**已经声明过同名 varying**（envmap 用）。照抄 → 同一份 shader 里重复声明 varying →
-顶点着色器编译失败；同时我们并未给它赋值，片元端读到的恒为 0。两个问题叠在一起，
-现象同样是"注入命中但参数完全不动画面"。我们改用 `vH3dWorldPos`。
+### 材质注入时期踩过的坑（已不适用，但值得记下来）
 
-> 教训：注入型改动的"命中"毫无意义。判据只有两个 ——
-> **编译后的着色器里真的有那段代码**（用 CDP 抓 `shaderSource` 看原文），
+这些是 0.4/0.5 第一版在材质注入上踩的，现在架构换了所以不存在了；
+留着是因为"注入型改动"这件事本身容易再遇到（比如以后要给材质加别的效果）：
+
+| 坑 | 现象 | 根因 |
+| --- | --- | --- |
+| 注入点只覆盖一种材质 | 链路全对、画面一动不动 | `outgoingLight` 的合成行**每种材质都不一样**（PBR / Basic / Lambert / Toon / Phong / Matcap / Points…），只认 PBR 那一种就静默漏掉其余 |
+| varying 重名 | 同上 | 参考站的 varying 叫 `vWorldPosition`，而 three 的顶点着色器在 `ENV_WORLDPOS` 分支里**已声明同名**，照抄 → 重复声明 → 顶点编译失败 |
+| uniform 改了不上传 | 同上（实测全屏均值恒为 188.71） | three 把「哪些 uniform 要上传」这张表**缓存在材质上**，而程序按 cacheKey 缓存：cacheKey 不变 ⇒ 只编译一次 ⇒ 之后改值永远不生效 |
+
+> 教训：**注入/后期改动的"命中"毫无意义**。判据只有两个 ——
+> 编译日志里没有错误（`renderer.info.programs[].diagnostics`），
 > 以及**像素真的变了**（`readPixels` 回读）。两者都做过才敢说修好了。
 
-### 陷阱三（最致命）：uniform 值改了但不会被上传，画面一动不动
-
-three 的 `getUniformList()` 把「这个程序里哪些 uniform 需要上传」这张表
-**缓存在材质上**（`materialProperties.uniformsList`），而程序是按 `customProgramCacheKey` 缓存的。
-两者合起来：**cacheKey 不变 ⇒ 程序只编译一次 ⇒ 之后改 `uniforms.xxx.value` 永远不会被上传**。
-
-表现极具误导性：注入命中了、`onBeforeCompile` 每次都调用、uniform 对象的现场值也是新的，
-**唯独画面纹丝不动**（真实页面实测：改 depth / height / color，全屏均值恒为 188.71）。
-参考站有同样的结构性问题，只是它把参数喂给 Leva 的初值、从不在运行时改，所以看不出来。
-
-对策（见 `src/fog.js` 的 `stateKey()`）：`customProgramCacheKey()` 里**带上当前参数值**，
-值一变就换一个程序；值变化时给所有已注入材质 `needsUpdate = true`。
-代价是拖滑块会重编译，换来的是"参数真的有效"。判定它有没有修好，**不能看 uniform 值，只能看像素**。
-
-## 动态雾（0.5）：噪声只扰动雾面高度
-
-来源：Codrops《The Sleepers》（同一作者 Thibaut Foussard）。核心做法是**用一张无缝噪声贴图代替运行时算噪声**
-——雾要注入到场景里每个材质，每帧每像素现算噪声代价太大。
-
-本项目的注入（见 `src/fog.js`）：
+### 从深度重建世界坐标：矩阵必须自己传
 
 ```glsl
-vec2 noiseUv = vH3dWorldPos.xz * fogNoiseScale
-             + vec2(uFogTime * fogFlow.x, uFogTime * fogFlow.y);
-vec2 warpOffset = texture2D(uFogNoise, noiseUv * 0.37).rg - 0.5;   // domain warp
-float noise = texture2D(uFogNoise, noiseUv + warpOffset * fogWarp).r;
-float noiseOffset = (noise - 0.5) * fogNoiseStrength * fogDynamic;
-
-float verticalMixer = smoothstep(y - fogSmoothness, y + fogSmoothness,
-                                 fogPositionY + noiseOffset);
-// …其余与 0.4 完全一致
+float viewZ  = (near * far) / ((far - near) * depth - far);   // 深度 → 视空间 z
+vec4 viewPos = uInvProjection * vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+viewPos /= viewPos.w;
+viewPos.z = viewZ;
+vec3 world = (uCameraWorld * vec4(viewPos.xyz, 1.0)).xyz;
 ```
 
-四个设计点：
+`uInvProjection` = `camera.projectionMatrixInverse`，`uCameraWorld` = `camera.matrixWorld`，
+由 `bindFogPassCamera()` **每帧刷新**（相机一动就得更新，否则雾会错位）。
 
-- **只动雾面高度**。噪声不参与深度项、不改混合权重，所以 `dynamic = 0` 时画面与 0.4 逐像素一致
-  （探针实测：关动态后推进时间，变化像素数为 0）。
-- **沿世界 xz 平面采样**。雾面是水平的，噪声该像一张铺在地面上的图，而不是贴在模型表面。
-- **domain warp** 让流动不规则：拿第一层噪声去推歪采样位置，比单纯平移更像雾。
-- **时间不进 cacheKey**。`uFogTime` 每帧都变，进指纹就等于每帧重编译；它只改 uniform 值。
+**坑**：`inverseProjectionMatrix` / `viewMatrixInverse` 这两个名字是 three 给**内建材质**注入的
+uniform，自定义 `ShaderMaterial` 拿不到。我一开始直接引用它们，结果是**片元编译失败**、
+整条后期链静默失效——控制台只有一句 shader error，画面看起来就是"雾没生效"，极难查。
+现在自己声明 `uInvProjection` / `uCameraWorld` 并手动传入。
+
+## 动态雾：噪声只扰动雾面高度，且必须是**三维**的
+
+来源：Codrops《The Sleepers》。核心做法是**用一张无缝噪声贴图代替运行时算噪声**——
+雾每帧要覆盖整个画面，现算噪声每像素都要付一遍代价。
+
+```glsl
+vec3 np = world * fogNoiseScale + vec3(uFogTime * fogFlow.x, uFogTime * fogFlow.y, uFogTime * fogFlowZ);
+float warp = noiseVolume(np * 0.37);                              // domain warp
+float n = noiseVolume(np + vec3((warp - 0.5) * fogWarp));
+float noiseOffset = (n - 0.5) * fogNoiseStrength * uFogDynamic;
+float verticalMixer = smoothstep(y - fogSmoothness, y + fogSmoothness,
+                                 fogPositionY + noiseOffset);
+```
+
+### 为什么噪声必须是三维的（第一版在这里被一眼看穿）
+
+第一版沿世界 `xz` 平面采样一张二维贴图。竖直的墙面/柱面上 `x`、`z` 几乎不变、只有 `y` 在变，
+而 `xz` 里没有 `y` —— 于是噪声被沿高度**拉成一条一条的竖条**。
+实测：沿一根竖直边采样，老做法的值域跨度是 **0**（完全不变），三维做法是 **40**。
+
+实现：`noiseVolume()` 在一张**二维无缝贴图**的两个"层"之间做三线性插值
+（每层给一个固定的 UV 偏移，层间按 z 的小数部分线性混合）。
+这样不需要 3D 纹理，兼容性最好，却是货真价实的三维噪声。
 
 ### 两个量级陷阱（都让我误判过"噪声没生效"）
 
-1. **噪声贴图必须在 `bindUniforms` 里更新，不能只在构造时写一次。**
-   否则运行期传进来的贴图永远不会绑到 sampler 上，采到的是未绑定纹理（纯黑），
-   于是"噪声"恒为常数、画面纹丝不动。
-2. **强度要和 `smoothness`（高度过渡带）同量级才看得见。**
-   过渡带 5 宽时，强度 0.35 只把界线推动 ±0.17（约 3%），肉眼看不出；
-   强度 6 时开关动态有约 14% 的像素变化。`noiseScale` 也不是越大越好：
-   它决定"一个噪声周期跨多少世界单位"（`1/noiseScale`），
+1. **强度要和 `smoothness`（高度过渡带）同量级才看得见。**
+   过渡带 5 宽时强度 0.35 只把界线推动 ±0.17（约 3%），肉眼看不出。
+   `noiseScale` 也不是越大越好：它决定"一个噪声周期跨多少世界单位"（`1/noiseScale`），
    若远大于模型尺寸，整个模型只落在一个噪声块里，雾界线只能整体平移、出不来起伏。
+2. **验收参数要选在"部分起雾"的区间。** 雾面抬到物体之上时整片饱和成白，
+   什么参数都看不出差别（我在探针里为此白跑了好几轮）。
 
 ### 噪声贴图怎么来的
 
@@ -275,8 +276,7 @@ float verticalMixer = smoothstep(y - fogSmoothness, y + fogSmoothness,
 - 贴图值域拉到满量程，少浪费 8 位精度。
 - `npm run check` 里带 `--check`，会比对文件与生成结果是否一致，防止手改或忘记重新生成。
 
-> 8 位精度够用：噪声只用于推动雾界线，量化台阶远小于过渡带宽度，实测画面无可见条带。
-
+> 8 位精度够用：噪声只用于推动雾界线，量化台阶远小于过渡带宽度。
 ## 背景与几何：天穹为什么存在、尺寸怎么定
 
 参考站（`projects.thibautfoussard.com/fog`）的场景构成与本项目的对应：

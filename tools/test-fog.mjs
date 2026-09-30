@@ -1,16 +1,10 @@
 /**
  * test-fog.mjs —— 雾模块（src/fog.js）的行为测试。
  *
- * 当前实现是**参考站 shader 的逐行移植**（https://projects.thibautfoussard.com/fog/）：
- *   verticalMixer = smoothstep(y - smoothness, y + smoothness, fogPositionY)
- *   depthMixer    = smoothstep(d + dSmooth, d - dSmooth, fogDepth)  → 再被 verticalMixer 门控
- *   mixer         = clamp(verticalMixer*.5 + depthMixer*.95, 0, 1) * fogEnabled
- *   outgoingLight = mix(outgoingLight, uFogColor, mixer)
- * 没有"模式"与"按高度分层"参数（早先自创的模型已废弃）。
- *
- * 这里验证：注入落地、uniform 值随设置更新（同一对象）、背景与雾色独立、
- * 以及**用到的 uniform 全部已声明**（曾漏声明导致整块渲白）。
- * 画面是否真的改变由 tools/probe-fog-pixels.mjs 用像素回读验证。
+ * 0.5 起雾**不再**是材质注入，而是**全屏后期 pass**（`src/fog-pass.js`）：
+ * 材质注入按定义只改实体表面，做不出"空间里有雾"。所以这里测的是
+ * 「背景三态 + 天穹同步 + 参数是否写进 pass 的 uniforms + 时间推进」，
+ * 着色器本身的行为由 `tools/probe-fog-pixels.mjs` 用真实 WebGL 回读像素验证。
  *
  * 运行：node tools/test-fog.mjs
  */
@@ -18,7 +12,6 @@ import * as THREE from 'three';
 import { createFog, FOG_DEFAULTS, BACKGROUND_MODES } from '../src/fog.js';
 
 // 渐变背景要 canvas：Node 里没有 DOM，补一个最小桩（只够 createLinearGradient / fillRect）。
-// 真浏览器里走的是原生实现，这里只为让 Node 测试能覆盖到 gradient 分支。
 if (typeof globalThis.document === 'undefined') {
   globalThis.document = {
     createElement: () => ({
@@ -40,217 +33,156 @@ const ok = (label, cond, extra = '') => {
 };
 const hex = (color) => color.getHexString().slice(0, 6);
 
+/** 假 pass：只记录 uniforms 被写成了什么（形状与 three 的 ShaderPass 一致） */
+function makeFakePass() {
+  return {
+    uniforms: {
+      tDiffuse: { value: null },
+      tDepth: { value: null },
+      cameraNear: { value: 0.1 },
+      cameraFar: { value: 1000 },
+      uInvProjection: { value: new THREE.Matrix4() },
+      uCameraWorld: { value: new THREE.Matrix4() },
+      uFogColor: { value: new THREE.Color(0xffffff) },
+      fogPositionY: { value: 0 },
+      fogSmoothness: { value: 0 },
+      fogDepth: { value: 0 },
+      fogDepthSmoothness: { value: 0 },
+      uFogEnabled: { value: 0 },
+      uFogNoise: { value: null },
+      fogNoiseScale: { value: 0 },
+      fogNoiseStrength: { value: 0 },
+      uFogTime: { value: 0 },
+      uFogDynamic: { value: 0 },
+      fogFlow: { value: new THREE.Vector2() },
+      fogFlowZ: { value: 0 },
+      fogWarp: { value: 0 },
+    },
+  };
+}
+
 const scene = new THREE.Scene();
-const material = new THREE.MeshStandardMaterial();
+const pass = makeFakePass();
+const fog = createFog(scene, null, pass);
 
 console.log('\n=== 1. 创建 ===');
-const fog = createFog(scene);
-ok('不再挂内置雾（距离与高度都在注入里算）', scene.fog === null, String(scene.fog));
-// 默认背景交给渐变天穹（'dome'）：此时必须**不设** scene.background，否则会把天穹盖住
+ok('不再挂内置雾（内置雾染不到背景，做不到全局）', scene.fog === null, String(scene.fog));
 ok('默认不设 scene.background（背景交给天穹）', scene.background === null, String(scene.background));
 ok('三种背景模式可选（天穹 / 纯色 / 渐变）', BACKGROUND_MODES.length === 3, BACKGROUND_MODES.map((m) => m.value).join(','));
-ok('四参数齐备（高度项 ×2 / 深度项 ×2）',
+ok('高度项与深度项的参数齐备',
   ['height', 'smoothness', 'depth', 'depthSmoothness'].every((k) => typeof FOG_DEFAULTS[k] === 'number'),
   ['height', 'smoothness', 'depth', 'depthSmoothness'].map((k) => `${k}=${FOG_DEFAULTS[k]}`).join(' '));
-ok('动态雾参数齐备（0.5）',
+ok('动态雾参数齐备',
   typeof FOG_DEFAULTS.dynamic === 'boolean'
-  && ['noiseStrength', 'noiseScale', 'flowX', 'flowY', 'warp'].every((k) => typeof FOG_DEFAULTS[k] === 'number'),
-  ['noiseStrength', 'noiseScale', 'flowX', 'flowY', 'warp'].map((k) => `${k}=${FOG_DEFAULTS[k]}`).join(' '));
+  && ['noiseStrength', 'noiseScale', 'flowX', 'flowY', 'flowZ', 'warp'].every((k) => typeof FOG_DEFAULTS[k] === 'number'),
+  ['noiseStrength', 'noiseScale', 'flowX', 'flowY', 'flowZ', 'warp'].map((k) => `${k}=${FOG_DEFAULTS[k]}`).join(' '));
 
-console.log('\n=== 2. 注入落地 ===');
-const parts = [{ material }];
-const shader = () => ({
-  uniforms: {},
-  vertexShader: '#include <common>\nvoid main() {\n\t#include <begin_vertex>',
-  fragmentShader: '#include <common>\nvec3 outgoingLight = totalDiffuse + totalSpecular + totalEmissiveRadiance;\n#include <dithering_fragment>',
-});
-fog.update({ enabled: true, height: -2, smoothness: 5, depth: 40, depthSmoothness: 25 }, parts);
-ok('材质被标记为已注入', material.userData.__fogAttached === true);
-ok('customProgramCacheKey 已设置', typeof material.customProgramCacheKey === 'function');
-const sh1 = shader();
-material.onBeforeCompile(sh1);
-ok('vertex 注入了 vH3dWorldPos 与赋值', /varying vec3 vH3dWorldPos;/.test(sh1.vertexShader)
-  && /vH3dWorldPos = \(modelMatrix \* vec4\(position, 1\.0\)\)\.xyz;/.test(sh1.vertexShader));
-// 曾照抄参考站的 varying 名 vWorldPosition，而 three 的顶点着色器在 ENV_WORLDPOS 分支里
-// 已经声明过同名 varying → 重复声明 → 顶点编译失败，表现为"注入命中但参数完全不动画面"
-{
-  const THREE_VERT = `
-    #ifdef ENV_WORLDPOS
-      varying vec3 vWorldPosition;
-    #endif
-    void main() {
-      #include <begin_vertex>
-    }`;
-  const probeShader = { uniforms: {}, vertexShader: THREE_VERT, fragmentShader: shader().fragmentShader };
-  material.onBeforeCompile(probeShader);
-  const decls = [...probeShader.vertexShader.matchAll(/varying\s+\w+\s+([A-Za-z_]\w*)\s*;/g)].map((m) => m[1]);
-  ok('即材质已有 vWorldPosition，也不会重复声明 varying',
-    decls.filter((d) => d === 'vWorldPosition').length === 1 && decls.includes('vH3dWorldPos'),
-    decls.join(','));
-}
-// 动态雾把噪声加在**雾面高度**上（fogPositionY + noiseOffset），公式其余部分一个字不改，
-// 所以 dynamic = 0 时画面与 0.4 逐像素一致。
-ok('动态：噪声加在雾面高度上', /smoothstep\(vH3dWorldPos\.y - fogSmoothness, vH3dWorldPos\.y \+ fogSmoothness, fogPositionY \+ noiseOffset\)/.test(sh1.fragmentShader));
-ok('动态：噪声来自贴图而不是现算', /texture2D\(uFogNoise,/.test(sh1.fragmentShader));
-ok('动态：沿 xz 平面采样（雾面是水平的）', /vH3dWorldPos\.xz \* fogNoiseScale/.test(sh1.fragmentShader));
-ok('动态：有 domain warp', /warpOffset/.test(sh1.fragmentShader) && /fogWarp/.test(sh1.fragmentShader));
-ok('动态：由 fogDynamic 开关（0 时噪声不参与）', /\* fogDynamic;/.test(sh1.fragmentShader));
-ok('动态：以时间流动', /uFogTime \* fogFlow\.x/.test(sh1.fragmentShader));
-ok('fragment 注入了深度项', /float depthMixer = smoothstep\(distanceToCamera \+ fogDepthSmoothness, distanceToCamera - fogDepthSmoothness, fogDepth\);/.test(sh1.fragmentShader));
-ok('深度项被高度项门控', /depthMixer = mix\(0\., depthMixer, verticalMixer\);/.test(sh1.fragmentShader));
-ok('相加加权 .5/.95（不是二选一混合）', /float mixer = verticalMixer \* \.5 \+ depthMixer \* \.95;/.test(sh1.fragmentShader));
-ok('混入雾色 uFogColor', /outgoingLight = mix\(outgoingLight, uFogColor, mixer\);/.test(sh1.fragmentShader));
-ok('uniforms 已挂上（含 0.5 的动态雾 uniform）', Object.keys(sh1.uniforms).join(',') ===
-  'uFogColor,fogPositionY,fogSmoothness,fogDepth,fogDepthSmoothness,fogEnabled,'
-  + 'uFogNoise,fogNoiseScale,fogNoiseStrength,uFogTime,fogDynamic,fogFlow,fogWarp',
-  Object.keys(sh1.uniforms).join(','));
+console.log('\n=== 2. 参数写进 pass 的 uniforms ===');
+fog.update({ enabled: true, height: -7.5, smoothness: 3, depth: 90, depthSmoothness: 12, color: '#ff0000' });
+ok('fogPositionY 写对了', pass.uniforms.fogPositionY.value === -7.5, String(pass.uniforms.fogPositionY.value));
+ok('fogSmoothness 写对了', pass.uniforms.fogSmoothness.value === 3, String(pass.uniforms.fogSmoothness.value));
+ok('fogDepth 写对了', pass.uniforms.fogDepth.value === 90, String(pass.uniforms.fogDepth.value));
+ok('fogDepthSmoothness 写对了', pass.uniforms.fogDepthSmoothness.value === 12, String(pass.uniforms.fogDepthSmoothness.value));
+ok('uFogColor 写对了', hex(pass.uniforms.uFogColor.value) === 'ff0000', hex(pass.uniforms.uFogColor.value));
+ok('uFogEnabled = 1', pass.uniforms.uFogEnabled.value === 1, String(pass.uniforms.uFogEnabled.value));
+ok('动态参数一并写入（强度 / 疏密 / 流动 / warp）',
+  pass.uniforms.fogNoiseStrength.value === FOG_DEFAULTS.noiseStrength
+  && pass.uniforms.fogNoiseScale.value === FOG_DEFAULTS.noiseScale
+  && pass.uniforms.uFogDynamic.value === (FOG_DEFAULTS.dynamic ? 1 : 0)
+  && pass.uniforms.fogFlow.value.x === FOG_DEFAULTS.flowX
+  && pass.uniforms.fogFlowZ.value === FOG_DEFAULTS.flowZ
+  && pass.uniforms.fogWarp.value === FOG_DEFAULTS.warp,
+  `str=${pass.uniforms.fogNoiseStrength.value} scl=${pass.uniforms.fogNoiseScale.value} flowZ=${pass.uniforms.fogFlowZ.value}`);
+fog.update({ enabled: false });
+ok('关雾时 uFogEnabled = 0', pass.uniforms.uFogEnabled.value === 0, String(pass.uniforms.uFogEnabled.value));
 
-console.log('\n=== 3. uniform 值随设置更新（同一对象，不重建）===');
-const before = sh1.uniforms;
-fog.update({ enabled: true, height: -7.5, smoothness: 3, depth: 90, depthSmoothness: 12, color: '#ff0000' }, parts);
-const sh2 = shader();
-material.onBeforeCompile(sh2);
-ok('uniforms 是同一个对象（已编译材质仍能看到新值）', sh2.uniforms.fogPositionY === before.fogPositionY, 'guarded');
-ok('fogPositionY 已更新', sh2.uniforms.fogPositionY.value === -7.5, String(sh2.uniforms.fogPositionY.value));
-ok('fogSmoothness 已更新', sh2.uniforms.fogSmoothness.value === 3, String(sh2.uniforms.fogSmoothness.value));
-ok('fogDepth 已更新', sh2.uniforms.fogDepth.value === 90, String(sh2.uniforms.fogDepth.value));
-ok('fogDepthSmoothness 已更新', sh2.uniforms.fogDepthSmoothness.value === 12, String(sh2.uniforms.fogDepthSmoothness.value));
-ok('雾色已更新', hex(sh2.uniforms.uFogColor.value) === 'ff0000', hex(sh2.uniforms.uFogColor.value));
-ok('开关位为 1', sh2.uniforms.fogEnabled.value === 1, String(sh2.uniforms.fogEnabled.value));
+console.log('\n=== 3. 多次 update 不重复、可覆盖 ===');
+fog.update({ height: -3 });
+ok('第二次 update 只改这一项，其余保持', pass.uniforms.fogPositionY.value === -3
+  && pass.uniforms.fogSmoothness.value === 3 && pass.uniforms.fogDepth.value === 90,
+  `Y=${pass.uniforms.fogPositionY.value} smooth=${pass.uniforms.fogSmoothness.value} depth=${pass.uniforms.fogDepth.value}`);
+ok('settings 快照能读回来', fog.settings.height === -3 && fog.settings.depth === 90,
+  JSON.stringify({ height: fog.settings.height, depth: fog.settings.depth }));
+// 后期 pass 每帧重读 uniform，所以**不需要** 0.4 那套"改 cacheKey 强制重编译"的把戏
+ok('没有留下材质注入的痕迹（不再有 attach / detach）',
+  typeof fog.attach === 'undefined' && typeof fog.detach === 'undefined');
 
-console.log('\n=== 4. 关闭雾：fogEnabled=0，但材质仍保留注入（不重编译）===');
-fog.update({ enabled: false, color: '#000000' }, parts);
-const sh3 = shader();
-material.onBeforeCompile(sh3);
-ok('fogEnabled=0（mixer 归零，画面不受雾影响）', sh3.uniforms.fogEnabled.value === 0, String(sh3.uniforms.fogEnabled.value));
-ok('注入仍在（没有拆掉再装）', material.userData.__fogAttached === true && /verticalMixer/.test(sh3.fragmentShader));
-
-console.log('\n=== 5. 背景三态与雾色的关系 ===');
-fog.update({ enabled: true, color: '#ffffff', bgMode: 'flat', bgColor: '#000000' }, parts);
-const sh4 = shader();
-material.onBeforeCompile(sh4);          // 快照必须在注入之后取，否则拿到的是原始 shader
-ok('雾色 = 白', hex(sh4.uniforms.uFogColor.value) === 'ffffff', hex(sh4.uniforms.uFogColor.value));
+console.log('\n=== 4. 背景三态与雾色的关系 ===');
+fog.update({ bgMode: 'flat', bgColor: '#000000', color: '#ffffff' });
 ok('纯色背景 = bgColor', hex(scene.background) === '000000', hex(scene.background));
-fog.update({ color: '#00ff00', bgMode: 'flat', bgColor: '#000000' }, parts);
-ok('改雾色不影响纯色背景', hex(scene.background) === '000000' && hex(sh4.uniforms.uFogColor.value) === '00ff00',
-  `bg=${hex(scene.background)} fog=${hex(sh4.uniforms.uFogColor.value)}`);
-fog.update({ bgMode: 'gradient', bgTop: '#000000', bgBottom: '#2a3038' }, parts);
+fog.update({ color: '#00ff00', bgMode: 'flat', bgColor: '#000000' });
+ok('改雾色不影响纯色背景', hex(scene.background) === '000000' && hex(pass.uniforms.uFogColor.value) === '00ff00',
+  `bg=${hex(scene.background)} fog=${hex(pass.uniforms.uFogColor.value)}`);
+fog.update({ bgMode: 'gradient', bgTop: '#000000', bgBottom: '#2a3038' });
 ok('渐变背景是贴图而不是 Color', scene.background?.isColor !== true && scene.background != null,
   scene.background?.constructor?.name);
-// 天穹态：不能设 scene.background（会盖住天穹），并且要把分界与颜色推给天穹
-fog.update({ bgMode: 'dome', color: '#ffffff', height: -5, smoothness: 3, bgTop: '#000000' }, parts);
-ok('天穹态下 scene.background 为空', scene.background === null, String(scene.background));
+fog.update({ bgMode: 'dome' });
+ok('天穹态下 scene.background 为空（否则会把天穹盖住）', scene.background === null, String(scene.background));
 
-console.log('\n=== 5b. 天穹同步（背景与雾必须同一分界，否则雾在天穹上"断掉"）===');
+console.log('\n=== 5. 天穹同步（背景与雾必须同一分界）===');
 {
-  const domeCalls = [];
+  const calls = [];
   const domeStub = {
-    setVisible: (v) => domeCalls.push(['visible', v]),
-    sync: (o) => domeCalls.push(['sync', o.position, o.smoothness, o.color, o.top]),
+    setVisible: (v) => calls.push(['visible', v]),
+    sync: (o) => calls.push(['sync', o.position, o.smoothness, o.color, o.top]),
   };
   const scene2 = new THREE.Scene();
   const fog2 = createFog(scene2, domeStub);
-  fog2.update({ bgMode: 'dome', color: '#ff8800', height: -5, smoothness: 3, bgTop: '#101010' }, []);
-  const sync = domeCalls.find((c) => c[0] === 'sync');
-  ok('天穹拿到与雾相同的 height / smoothness',
-    sync?.[1] === -5 && sync?.[2] === 3, JSON.stringify(sync));
+  fog2.update({ bgMode: 'dome', color: '#ff8800', height: -5, smoothness: 3, bgTop: '#101010' });
+  const sync = calls.find((c) => c[0] === 'sync');
+  ok('天穹拿到与雾相同的 height / smoothness', sync?.[1] === -5 && sync?.[2] === 3, JSON.stringify(sync));
   ok('天穹底部 = 雾色、顶部 = bgTop', sync?.[3] === '#ff8800' && sync?.[4] === '#101010',
     `${sync?.[3]} / ${sync?.[4]}`);
-  domeCalls.length = 0;
-  fog2.update({ bgMode: 'flat', bgColor: '#000000' }, []);
-  ok('切到纯色背景时天穹隐藏', domeCalls.some((c) => c[0] === 'visible' && c[1] === false),
-    JSON.stringify(domeCalls));
-  domeCalls.length = 0;
-  fog2.update({ bgMode: 'dome' }, []);
-  ok('切回天穹时天穹显示', domeCalls.some((c) => c[0] === 'visible' && c[1] === true),
-    JSON.stringify(domeCalls));
+  calls.length = 0;
+  fog2.update({ bgMode: 'flat', bgColor: '#000000' });
+  ok('切到纯色背景时天穹隐藏', calls.some((c) => c[0] === 'visible' && c[1] === false), JSON.stringify(calls));
+  calls.length = 0;
+  fog2.update({ bgMode: 'dome' });
+  ok('切回天穹时天穹显示', calls.some((c) => c[0] === 'visible' && c[1] === true), JSON.stringify(calls));
+
+  // 没有 pass 时不能崩（Node 里常常没有后期链）
+  ok('没有 pass 时 update 不报错', (() => {
+    try { fog2.update({ height: 1 }); return true; } catch { return false; }
+  })());
   fog2.dispose();
 }
 
-console.log('\n=== 6. 声明完整性（曾漏声明导致整块渲白）===');
-fog.update({ bgMode: 'flat', bgColor: '#000000' }, parts);
-const frag = sh4.fragmentShader;
-const names = ['uFogColor', 'fogPositionY', 'fogSmoothness', 'fogDepth', 'fogDepthSmoothness', 'fogEnabled',
-  'uFogNoise', 'fogNoiseScale', 'fogNoiseStrength', 'uFogTime', 'fogDynamic', 'fogFlow', 'fogWarp'];
-const declared = new Set([...frag.matchAll(/uniform\s+\w+\s+([A-Za-z_]\w*)\s*;/g)].map((m) => m[1]));
-const undeclared = names.filter((u) => !declared.has(u));
-ok('注入声明的雾 uniform 全部齐备', undeclared.length === 0, undeclared.join(',') || '无遗漏');
-const occurrencesOf = (name) => [...frag.matchAll(new RegExp(`uniform\\s+\\w+\\s+${name}\\s*;`, 'g'))].length;
-ok('声明数量与用法一致（不重复）', names.every((n) => occurrencesOf(n) === 1),
-  names.map((n) => `${n}×${occurrencesOf(n)}`).join(' '));
-// 只声明还不够：着色器里用到的每个 uniform 标识符都必须真的出现过声明，
-// 否则又是"用了没声明 → 整块渲白"（踩过）。这里反向查一遍。
-const usedIds = new Set([...frag.matchAll(/\b(u?Fog[A-Za-z]\w*|fog[A-Z]\w*|uFog\w*)\b/g)].map((m) => m[1]));
-const notDeclared = [...usedIds].filter((id) => !declared.has(id) && names.includes(id));
-ok('用到的标识符都有声明（反向查）', notDeclared.length === 0, notDeclared.join(',') || '无遗漏');
-ok('vH3dWorldPos 在 vertex 与 fragment 两端都声明',
-  /varying vec3 vH3dWorldPos;/.test(sh4.vertexShader) && /varying vec3 vH3dWorldPos;/.test(frag));
-
-console.log('\n=== 7. 参数变化必须换程序（这是"改了参数画面不动"的根因）===');
-// three 的 getUniformList() 把「哪些 uniform 要上传」缓存在材质上，而程序按 cacheKey 缓存。
-// cacheKey 固定 ⇒ 程序只编译一次 ⇒ 之后改 uniform 值根本不会被上传（真实页面实测 avg 恒为 188.71）。
-// 所以：cacheKey 必须随参数值变化，并且值变了要让已注入的材质 needsUpdate。
-const keyFor = (s) => {
-  fog.update(s, parts);
-  return material.customProgramCacheKey();
-};
-const keyA = keyFor({ height: -2, smoothness: 5, depth: 70, depthSmoothness: 25, enabled: true, color: '#ffffff' });
-const keyB = keyFor({ height: -2, smoothness: 5, depth: 2000, depthSmoothness: 25, enabled: true, color: '#ffffff' });
-const keyC = keyFor({ height: -2, smoothness: 5, depth: 70, depthSmoothness: 25, enabled: true, color: '#ffffff' });
-ok('depth 变了 → cacheKey 变（会重新编译）', keyA !== keyB, `${keyA.slice(-34)} vs ${keyB.slice(-34)}`);
-ok('值改回来 → cacheKey 也回到原样（程序可复用）', keyA === keyC, keyC.slice(-34));
+console.log('\n=== 6. tick：推进流动时间并写进 uniform ===');
 {
-  fog.update({ height: -2, depth: 70, color: '#ffffff' }, parts);
-  const versionBefore = material.version;
-  fog.update({ height: -2, depth: 70, color: '#ffffff' }, parts);
-  ok('参数没变时不触发重编译（拖滑块回到原位不会白编译）',
-    material.version === versionBefore, `${versionBefore} -> ${material.version}`);
-}
-ok('tune 返回 true', fog.tune({ depth: 33, height: -5 }) === true);
-ok('tune 改了 uniform', sh4.uniforms.fogDepth.value === 33 && sh4.uniforms.fogPositionY.value === -5,
-  `depth=${sh4.uniforms.fogDepth.value} height=${sh4.uniforms.fogPositionY.value}`);
-// 动态参数与其它参数同受"值变了必须换程序"的约束
-ok('改起伏强度 → cacheKey 变', keyFor({ noiseStrength: 1.2 }) !== keyFor({ noiseStrength: 0.35 }));
-ok('改流动速度 → cacheKey 变', keyFor({ flowX: 0.2 }) !== keyFor({ flowX: 0.012 }));
-ok('关掉动态 → cacheKey 变', keyFor({ dynamic: false }) !== keyFor({ dynamic: true }));
-
-console.log('\n=== 7b. tick：推进流动时间，但绝不触发重编译 ===');
-{
-  fog.update({ dynamic: true, flowX: 0.012 }, parts);
-  const versionBefore = material.version;
-  const t0 = fog.time;
+  fog.update({ dynamic: true });
+  fog.resetTime();
+  ok('resetTime 归零', fog.time === 0 && pass.uniforms.uFogTime.value === 0, String(fog.time));
   fog.tick(0.5);
   fog.tick(0.5);
-  ok('tick 累加了流动时间', Math.abs(fog.time - (t0 + 1)) < 1e-9, `${t0} -> ${fog.time}`);
-  ok('tick 不触发重编译（uFogTime 不进指纹）', material.version === versionBefore,
-    `${versionBefore} -> ${material.version}`);
-  ok('tick 后 uniform 里的时间与 fog.time 一致', sh4.uniforms.uFogTime.value === fog.time,
-    `uniform=${sh4.uniforms.uFogTime.value} getter=${fog.time}`);
+  ok('tick 累加时间', Math.abs(fog.time - 1) < 1e-9, String(fog.time));
+  ok('tick 把时间写进 uniform', pass.uniforms.uFogTime.value === fog.time,
+    `uniform=${pass.uniforms.uFogTime.value} getter=${fog.time}`);
   fog.tick(-1);
   fog.tick(NaN);
-  ok('非法 dt 被忽略（负数 / NaN）', Math.abs(fog.time - (t0 + 1)) < 1e-9, String(fog.time));
-  fog.resetTime();
-  ok('resetTime 归零', fog.time === 0, String(fog.time));
-  // 长时间运行：取模避免浮点精度下降，且不该溢出
+  fog.tick(0);
+  ok('非法 dt 被忽略（负数 / NaN / 0）', Math.abs(fog.time - 1) < 1e-9, String(fog.time));
   for (let i = 0; i < 5000; i++) fog.tick(1);
   ok('长时间推进不会溢出或掉精度', fog.time >= 0 && fog.time < 3600, String(fog.time));
   fog.resetTime();
 }
 
-console.log('\n=== 8. 幂等：反复 update 不会叠加注入 ===');
-const hookAfterFirst = material.onBeforeCompile;
-for (let i = 0; i < 5; i++) fog.update({ height: i }, parts);
-const shN = shader();
-material.onBeforeCompile(shN);
-const occurrences = (shN.fragmentShader.match(/float verticalMixer/g) ?? []).length;
-ok('onBeforeCompile 没有被层层包裹', material.onBeforeCompile === hookAfterFirst);
-ok('注入片段只出现一次', occurrences === 1, String(occurrences));
+console.log('\n=== 7. attachPass：pass 后到也能接上 ===');
+{
+  const scene3 = new THREE.Scene();
+  const late = makeFakePass();
+  const fog3 = createFog(scene3, null);          // 先不给 pass
+  fog3.update({ height: -9, depth: 33 });
+  ok('没有 pass 时只记设置', fog3.settings.height === -9, String(fog3.settings.height));
+  fog3.attachPass(late);
+  ok('attachPass 后立刻把当前设置灌进去', late.uniforms.fogPositionY.value === -9
+    && late.uniforms.fogDepth.value === 33,
+    `Y=${late.uniforms.fogPositionY.value} depth=${late.uniforms.fogDepth.value}`);
+  fog3.dispose();
+}
 
-console.log('\n=== 9. dispose：材质恢复干净 ===');
+console.log('\n=== 8. dispose ===');
 fog.dispose();
-ok('注入标记已清除', !material.userData.__fogAttached);
-ok('customProgramCacheKey 已还原', material.customProgramCacheKey === undefined || typeof material.customProgramCacheKey === 'function');
 ok('背景渐变资源已释放', fog.gradientTexture === null || fog.gradientTexture === undefined);
 
-console.log(`\n${failures ? `存在 ${failures} 个失败项` : '雾模块测试通过（注入 / 单位更新 / 背景独立 / 声明完整 / cacheKey / 幂等 / dispose）'}\n`);
+console.log(`\n${failures ? `存在 ${failures} 个失败项` : '雾模块测试通过（背景三态 / 天穹同步 / pass 参数 / tick / attachPass）'}\n`);
 process.exitCode = failures ? 1 : 0;

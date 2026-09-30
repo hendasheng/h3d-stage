@@ -10,7 +10,8 @@ import * as THREE from 'three';
 import { render, h } from 'preact';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createEnvironmentLighting } from './environment.js';
-import { createFog } from './fog.js';
+import { createFog, FOG_DEFAULTS } from './fog.js';
+import { FOG_PASS_SHADER, bindFogPassCamera } from './fog-pass.js';
 import { getFogNoiseTexture } from './fog-texture.js';
 import { createSkyDome } from './sky-dome.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -18,6 +19,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { configureKeyShadow, setSelfShadows, setShadowSoftness } from './shadows.js';
 import { App } from './ui/App.jsx';
@@ -48,7 +50,7 @@ const GRID_SIZE = 40;       // 世界网格边长（同时作为格数 → 每�
 let renderer, scene, camera, controls, modelRoot, centerGroup, raycaster, worldGrid;
 let keyLight;
 let environmentLighting;
-let composer, bloomPass, gtaoPass;
+let composer, bloomPass, gtaoPass, fogPass, fogCamera;
 let fog;   // 由 createFog(scene, skyDome) 创建，见 src/fog.js
 let skyDome;   // 渐变天穹（背景），见 src/sky-dome.js
 const auxiliaryLights = [];
@@ -203,12 +205,16 @@ async function loadModel(file) {
       scene: () => scene,
       camera: () => camera,
       renderer: () => renderer,
+      composer: () => composer,
+      fog,
+      store,
       fogInfo: () => ({
         sceneFog: scene.fog ? { near: scene.fog.near, far: scene.fog.far, color: '#' + scene.fog.color.getHexString() } : null,
         background: scene.background?.isColor ? '#' + scene.background.getHexString() : (scene.background ? 'texture' : null),
-        attached: store.parts.filter((p) => p.material?.userData?.__fogAttached).length,
+        passAttached: !!fogPass,
         domeVisible: skyDome?.dome?.visible ?? false,
         parts: store.parts.length,
+        time: fog?.time ?? 0,
       }),
     };
   }
@@ -290,8 +296,8 @@ function initThree() {
   skyDome = createSkyDome();
   scene.add(skyDome.dome);
 
-  // 雾（材质注入）+ 动态雾用的无缝噪声贴图
-  fog = createFog(scene, skyDome, getFogNoiseTexture());
+  // 雾：由全屏后期 pass 完成（见下方 composer），这里先建管理器（背景/天穹/参数）
+  fog = createFog(scene, skyDome);
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
@@ -323,7 +329,18 @@ function initThree() {
   raycaster = new THREE.Raycaster();
 
   // 标准场景后期：先在 HDR 中生成辉光，最后统一做色调映射与颜色空间转换。
-  composer = new EffectComposer(renderer);
+  //
+  // 雾走**全屏后期**（不是材质注入）：它需要场景的深度来重建每个像素的世界坐标。
+  // 所以给 composer 的 render target 挂一张深度纹理 —— RenderPass 渲染时会把深度写进去，
+  // 雾 pass 读它。这是"雾能作用在整个画面上"的前提。
+  const fogDepthTexture = new THREE.DepthTexture(innerWidth, innerHeight);
+  fogDepthTexture.format = THREE.DepthFormat;
+  fogDepthTexture.type = THREE.UnsignedShortType;
+  const composerTarget = new THREE.WebGLRenderTarget(innerWidth, innerHeight, {
+    depthBuffer: true,
+    depthTexture: fogDepthTexture,
+  });
+  composer = new EffectComposer(renderer, composerTarget);
   composer.addPass(new RenderPass(scene, camera));
   gtaoPass = new GTAOPass(scene, camera, innerWidth, innerHeight);
   gtaoPass.blendIntensity = store.gtaoIntensity.value;
@@ -335,7 +352,18 @@ function initThree() {
     store.bloomStrength.value, store.bloomRadius.value, store.bloomThreshold.value,
   );
   composer.addPass(bloomPass);
+  // 雾在辉光之后、色调映射之前：这样雾色与场景一同经过 OutputPass，颜色才一致
+  fogPass = new ShaderPass(FOG_PASS_SHADER);
+  fogPass.uniforms.tDepth.value = fogDepthTexture;
+  // 相机矩阵必须自己传（ShaderMaterial 拿不到 three 的内建矩阵），并且每帧刷新
+  fogCamera = bindFogPassCamera(fogPass, camera);
+  composer.addPass(fogPass);
   composer.addPass(new OutputPass());
+
+  // 把 pass 交给雾管理器，并把噪声贴图与当前参数灌进去
+  fog.attachPass(fogPass);
+  fog.update({ noiseTexture: getFogNoiseTexture() });
+  applyFogCurrent();
 
   window.addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight;
@@ -354,6 +382,8 @@ function tick(now = 0) {
   controls.update();
   // 天穹每帧跟随相机：半径远小于远裁剪面，不跟随就会"走出天空"
   skyDome?.followCamera(camera);
+  // 相机一动，从深度反推世界坐标用的矩阵就得跟着更新，否则雾会错位
+  fogCamera?.update();
 
   // 动态雾：用真实经过的时间推进流动，与帧率无关。
   // 首帧没有上一帧时间戳（now 可能是 0），跳过以免产生一个巨大的 dt。
@@ -584,7 +614,6 @@ async function buildParts() {
 
   applyColors();
   setWireframe(store.parts, store.wireframe.value);
-  // 新模型的材质是新的：竖直分层雾需要重新注入（线性雾不用）
   applyFogCurrent();
   classMaterials = buildClassMaterialIndex(store.parts);   // class → 材质，发光时按编号直取
   glow.clearAll();
@@ -593,10 +622,13 @@ async function buildParts() {
   updateDebug();
 }
 
-/** 用当前 store 里的设置应用一次雾（buildParts 之后材质变了要重来一次） */
+/**
+ * 用当前 store 里的设置应用一次雾。
+ *
+ * 注意这里**不再需要传部件列表**：雾是全屏后期 pass，与模型材质无关，
+ * 所以"换了模型要重新注入"这件事不存在了 —— 换模型不影响雾。（0.4 的材质注入才需要。）
+ */
 function applyFogCurrent() {
-  // 只注入模型部件：没有地面之后，判断标准就是"模型本身有没有被雾染"
-  const targets = store.parts;
   fog?.update({
     enabled: store.fogEnabled.value,
     color: store.fogColor.value,
@@ -615,7 +647,7 @@ function applyFogCurrent() {
     flowX: store.fogFlowX.value,
     flowY: store.fogFlowY.value,
     warp: store.fogWarp.value,
-  }, targets);
+  });
 }
 
 /**
