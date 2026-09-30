@@ -5,6 +5,17 @@
 
 ---
 
+## 雾试验参考（暂停）
+
+已评估的参考实现：
+
+- [Thibaut Foussard — Fog](https://projects.thibautfoussard.com/fog/)
+- [The Sleepers: Creating an Atmospheric WebGL Experience with Lightweight Techniques](https://tympanus.net/codrops/2026/07/10/the-sleepers-creating-an-atmospheric-webgl-experience-with-lightweight-techniques/)
+
+后续的雾尝试效果仍不符合项目要求，当前暂停继续调整；这些链接仅作为已评估的参考，不代表项目雾效果已完成。
+
+---
+
 ## Houdini `class` → glTF `_class`（核心机制）
 
 Houdini 的 glTF 导出器给自定义属性名加下划线：
