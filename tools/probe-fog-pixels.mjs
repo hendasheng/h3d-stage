@@ -1,21 +1,29 @@
 /**
- * probe-fog-pixels.mjs —— 在真实 WebGL 里渲染并**回读像素**，验证雾确实改变了画面。
+ * probe-fog-pixels.mjs —— 在真实 WebGL 里渲染并回读像素，验证雾确实改变了画面。
  *
- * ## 为什么用"离屏单帧"而不是给页面截图
+ * 为什么需要像素级验证：shader 注入"命中"、uniform"挂上"都不等于画面改变
+ * （公式算错、方向反了、uniform 没生效都可能看不出来）。
  *
- * 0.5 期间我试过在真实页面上调参数 + 截图取样，全部失败：
- * `Page.captureScreenshot` 会反复返回同一帧，`canvas.toDataURL()` 同样如此
- * （同一状态多次截图 sha 完全相同、把背景设成 null 也不变）。那是 headless 合成的时序问题，
- * 不是应用的问题 —— 我在这上面浪费了很多轮，所以现在**只做确定性单帧**：
- * 自己建 renderer / scene / render target，渲染一次、跑一次雾 pass、readPixels。
+ * 探针分两段，各自用**不会串味**的最小场景：
  *
- * ## 测什么
+ *   第一段 雾（材质注入）—— 正交相机 + 一块正对相机、占满画面的板。
+ *     画面里从头到尾只有这一块板（背景也让路：不挂天穹、背景设成与板不同色），
+ *     所以"像素变了"只可能是雾造成的。板放远一点，深度项才有量程。
  *
- *   第一段 全局性：场景里有一块远处的板，其余是纯背景。
- *     **纯背景像素被雾染到**，就证明雾作用于整个画面 —— 这正是材质注入做不到的
- *     （材质注入只能改实体表面，永远得不到"空间里有雾"）。
- *   第二段 竖直面不再被拉成条：同一根竖直的柱面，比较三种噪声取法沿高度的变化量。
- *   第三段 参数确实起作用：高度 / 深度 / 雾色 / 时间，逐项对比像素。
+ *   第二段 天穹（背景）—— 一块大地面 + 天穹，斜视。
+ *     天穹是背景不是雾，所以单独一段验证：取样点分别落在天穹与地面上，互不遮挡。
+ *
+ * 公式的两条推论（写断言前先想清楚，别把公式本身当 bug）：
+ *   mixer = clamp(verticalMixer*.5 + verticalMixer*depthMixer*.95, 0, 1)
+ *   · verticalMixer=1 且 depthMixer=0 时，画面已有 0.5 的雾量 —— "高度项吃满"不等于"过曝"
+ *   · verticalMixer=0 时两项**一起**归零，所以此时怎么调 depth 都不会有雾
+ *
+ * 做法：DevTools Protocol 打开 dev server 上的页面，页面内 import 真实模块建场景、
+ * 渲染到离屏 canvas、readPixels，再把统计值返回。
+ *
+ * 材质一律用 MeshBasicMaterial（不受光照影响，画面只反映雾）。踩过：
+ * 注入点原来只匹配 PBR 材质的 `totalDiffuse + totalSpecular + …`，探测场景用 Basic 材质，
+ * 于是"注入命中、uniform 挂上、画面一动不动"。
  *
  * 运行：npm run probe:fog   （需要 dev server 在 5178）
  */
@@ -67,12 +75,8 @@ try {
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
   let id = 0;
   const pending = new Map();
-  const logs = [];
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
-    if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') {
-      logs.push(m.params.args.map((a) => a.value || a.description || '').join(' ').slice(0, 300));
-    }
     if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
   };
   const evaluate = (expr) => new Promise((res) => {
@@ -84,212 +88,135 @@ try {
     ws.send(JSON.stringify({ id: mid, method: 'Runtime.evaluate', params: { expression: expr, awaitPromise: true, returnByValue: true } }));
   });
 
+  // 走 dev server 的页面，才能用 Vite 的模块解析 import 'three'
   await evaluate(`location.href = 'http://127.0.0.1:5178/'`).catch(() => {});
-  await sleep(2500);
+  await sleep(1500);
 
-  console.log('\n=== 离屏单帧渲染 + 像素回读 ===');
+  console.log('\n=== 离屏渲染 + 像素回读 ===');
   const result = await evaluate(String.raw`
     (async () => {
       const THREE = await import('/node_modules/.vite/deps/three.js');
-      const { ShaderPass } = await import('/node_modules/three/examples/jsm/postprocessing/ShaderPass.js');
-      const { FOG_PASS_SHADER, bindFogPassCamera } = await import('/src/fog-pass.js');
-      const { getFogNoiseTexture } = await import('/src/fog-texture.js');
+      const { createFog, FOG_DEFAULTS } = await import('/src/fog.js');
+      const { createSkyDome } = await import('/src/sky-dome.js');
 
       const W = 64, H = 64;
       const canvas = document.createElement('canvas');
       canvas.width = W; canvas.height = H;
-      const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true });
+      renderer.setPixelRatio(1);
       renderer.setSize(W, H);
-      renderer.debug.checkShaderErrors = true;
-
-      const depthTexture = new THREE.DepthTexture(W, H);
-      depthTexture.format = THREE.DepthFormat;
-      depthTexture.type = THREE.UnsignedShortType;
-      const sceneRt = new THREE.WebGLRenderTarget(W, H, { depthBuffer: true, depthTexture });
-      const outRt = new THREE.WebGLRenderTarget(W, H, { depthBuffer: false });
+      const gl = renderer.getContext();
       const buf = new Uint8Array(W * H * 4);
 
-      const noise = getFogNoiseTexture();
-      await new Promise((res) => {
-        if (noise && noise.image && noise.image.width) return res();
-        if (noise) noise.addEventListener('load', res);
-        setTimeout(res, 3000);
-      });
-
-      /* ---------- 场景：一块远处的板，四周是纯背景；另有一根竖直柱面 ---------- */
-      const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x000000);
-      const cam = new THREE.PerspectiveCamera(50, 1, 0.5, 4000);
-      cam.position.set(0, 0, 0);
-      cam.lookAt(0, 0, -1);
-      const mat = new THREE.MeshBasicMaterial({ color: 0x606060 });
-      // 板放在右侧（屏幕右半），左侧留给"纯背景"，方便分别取样
-      const plate = new THREE.Mesh(new THREE.PlaneGeometry(6, 12), mat);
-      plate.position.set(6, 0, -60);
-      scene.add(plate);
-
-      const pass = new ShaderPass(FOG_PASS_SHADER);
-      pass.uniforms.tDepth.value = depthTexture;
-      pass.uniforms.uFogNoise.value = noise;
-      const camBinder = bindFogPassCamera(pass, cam);
-
-      // 参数刻意选在"**部分起雾**"的区间：板的竖直跨度是 ±6、过渡带 1，
-      // 所以雾面在 0 以上时整块板都饱和（全白），什么参数都看不出差别 —— 这是我踩过的坑。
-      // 取负值让板落在过渡带里，差异才有分辨力。
-      const BASE = { enabled: true, height: 0, smoothness: 1, depth: 100, depthSmoothness: 10,
-        color: '#ffffff', dynamic: false, noiseStrength: 0, noiseScale: 0.06,
-        flowX: 0.012, flowY: 0.007, flowZ: 0.006, warp: 0.35 };
-
-      const frame = new Uint8Array(W * H * 4);
-      const box = (x0, y0, x1, y1) => {
+      const mean = (x0, y0, x1, y1) => {
         let sum = 0, n = 0;
-        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { sum += frame[(y * W + x) * 4]; n++; }
+        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { sum += buf[(y * W + x) * 4]; n++; }
         return +(sum / n).toFixed(1);
       };
-      const rgb = (x0, y0, x1, y1) => [0, 1, 2].map((c) => {
-        let s = 0, n = 0;
-        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { s += frame[(y * W + x) * 4 + c]; n++; }
-        return (s / n).toFixed(0);
-      }).join('/');
+      /** 中央区域的均值：板占满画面时就是"这块板的颜色" */
+      const center = () => mean(8, 8, W - 8, H - 8);
 
-      /** 渲染一帧并应用雾 pass。**每次都要先重新渲染场景**，否则读的是旧颜色/旧深度。 */
-      const shoot = (s, time = 0) => {
-        const u = pass.uniforms;
-        u.uFogColor.value.set(s.color);
-        u.fogPositionY.value = s.height;
-        u.fogSmoothness.value = s.smoothness;
-        u.fogDepth.value = s.depth;
-        u.fogDepthSmoothness.value = s.depthSmoothness;
-        u.uFogEnabled.value = s.enabled ? 1 : 0;
-        u.fogNoiseScale.value = s.noiseScale;
-        u.fogNoiseStrength.value = s.noiseStrength;
-        u.uFogDynamic.value = s.dynamic ? 1 : 0;
-        u.fogFlow.value.set(s.flowX, s.flowY);
-        u.fogFlowZ.value = s.flowZ;
-        u.fogWarp.value = s.warp;
-        u.uFogTime.value = time;
-        camBinder.update();
-
-        renderer.setRenderTarget(sceneRt);
-        renderer.render(scene, cam);
-        renderer.setRenderTarget(null);
-        pass.render(renderer, outRt, sceneRt, 0, false);
-        renderer.readRenderTargetPixels(outRt, 0, 0, W, H, buf);
-        frame.set(buf);
-        return {
-          bg: box(4, 24, 20, 40),          // 左侧：纯背景，没有几何
-          plate: box(40, 24, 60, 40),      // 右侧：远处的板
-          all: box(0, 0, W, H),
-        };
-      };
       const OUT = [];
       const DIAG = [];
-      const runCase = (label, s, time) => {
-        const r = shoot(s, time);
-        OUT.push({ label, ...r, rgb: rgb(4, 24, 20, 39) });
-        return r;
-      };
 
-      // 先确认深度纹理里**真的有场景深度**：如果它是一张没被渲染过的纹理（初值是垃圾），
-      // 雾量就会逐帧乱跳 —— 用户看到的就是"整屏爆闪"。
-      // 做法：把深度直接当颜色输出，看背景（远）与板（近）是否明显不同。
-      const depthProbe = new ShaderPass({
-        uniforms: { tDepth: { value: depthTexture } },
-        vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
-        fragmentShader: 'uniform sampler2D tDepth; varying vec2 vUv;'
-          + 'void main(){ float d = texture2D(tDepth, vUv).x; gl_FragColor = vec4(d, d, d, 1.0); }',
-      });
-      renderer.setRenderTarget(sceneRt);
-      renderer.render(scene, cam);
-      renderer.setRenderTarget(null);
-      depthProbe.render(renderer, outRt, sceneRt, 0, false);
-      renderer.readRenderTargetPixels(outRt, 0, 0, W, H, buf);
-      const dAt = (x, y) => buf[(y * W + x) * 4];
-      let dMin = 255, dMax = 0;
-      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-        const v = dAt(x, y);
-        if (v < dMin) dMin = v;
-        if (v > dMax) dMax = v;
-      }
-      DIAG.push('深度纹理：背景(远)=' + dAt(8, 32) + '，板(近)=' + dAt(50, 32)
-        + '，全图值域 ' + dMin + '..' + dMax
-        + (dMax - dMin > 5 ? ' → 有真实深度' : ' → 深度是常量（雾会乱跳）'));
-      DIAG.push('三种 depthTexture 的合法性：'
-        + 'sceneRt.depthTexture=' + (sceneRt.depthTexture ? 'yes' : 'no')
-        + ' outRt.depthTexture=' + (outRt.depthTexture ? 'yes' : 'no'));
-      {
-        // 用**当前真正被绑定的那张**深度再探一次（排除"我读错了 target"这种可能）
-        const t = pass.uniforms.tDepth.value;
-        DIAG.push('雾 pass 绑的 tDepth 是不是 depthTexture：' + (t === depthTexture));
-        const p2 = new ShaderPass({
-          uniforms: { tDepth: { value: t } },
-          vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
-          fragmentShader: 'uniform sampler2D tDepth; varying vec2 vUv;'
-            + 'void main(){ float d = texture2D(tDepth, vUv).x; gl_FragColor = vec4(d, d, d, 1.0); }',
+      /* ================= 第一段：雾 ================= */
+      // 透视相机在原点朝 -Z，一块正对相机、**铺满视野**的板放在 z = -d：
+      // 板上每点到相机的距离都恰好是 d（正对相机，不用管斜边）。
+      // 板必须覆盖 50° 视野在距离 d 处的高度 2*d*tan(25°) ≈ 0.93d，所以按距离缩放 1x1 的平面。
+      // （踩过：板做小了，中央取到的是背景黑，"雾没变化"全是假象。）
+      const sceneA = new THREE.Scene();
+      const cameraA = new THREE.PerspectiveCamera(50, 1, 0.1, 2000);
+      cameraA.position.set(0, 0, 0);
+      cameraA.lookAt(0, 0, -1);
+      const plateMat = new THREE.MeshBasicMaterial({ color: 0x505050 });
+      const plate = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), plateMat);
+      sceneA.add(plate);
+      const fogA = createFog(sceneA, null);
+
+      const setPlate = (d, s) => {
+        plate.position.z = -d;
+        plate.scale.set(d * 1.2, d * 1.2, 1);   // 铺满视野
+        // 背景用纯黑、与板不同色：板没盖到的地方一眼能看出来，不会有"板其实是背景"的误会
+        fogA.update({ color: '#ffffff', bgMode: 'flat', bgColor: '#000000',
+          height: 40, smoothness: 2, depth: 100, depthSmoothness: 5, ...s }, [{ material: plateMat }]);
+      };
+      const shotA = (label) => {
+        renderer.render(sceneA, cameraA);
+        gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+        // 顺手把注入后的 uniform 现场值带出来，异常时能一眼看出是"值不对"还是"值对了但画面不对"
+        const sh = { uniforms: {}, vertexShader: 'void main() {\n}',
+          fragmentShader: '#include <common>\nvec3 outgoingLight = totalDiffuse + totalSpecular + totalEmissiveRadiance;' };
+        plateMat.onBeforeCompile(sh);
+        OUT.push({
+          seg: 'A', label, val: center(), corner: mean(2, 2, 5, 5),
+          u: 'py=' + sh.uniforms.fogPositionY.value + ' dep=' + sh.uniforms.fogDepth.value
+            + ' on=' + sh.uniforms.fogEnabled.value,
         });
-        p2.render(renderer, outRt, sceneRt, 0, false);
-        renderer.readRenderTargetPixels(outRt, 0, 0, W, H, buf);
-        DIAG.push('  同一张深度再读：背景=' + buf[(32 * W + 8) * 4] + ' 板=' + buf[(32 * W + 50) * 4]);
-      }
-
-      runCase('A 关雾', { ...BASE, enabled: false });
-      runCase('B 开雾（基准）', BASE);
-      runCase('C 雾面压到 y=-800（无雾）', { ...BASE, height: -800 });
-      runCase('D 雾面抬到 y=8（更浓）', { ...BASE, height: 8 });
-      runCase('E 深度 45（近处也起雾）', { ...BASE, depth: 45 });
-      runCase('F 深度 100（远处才起雾）', { ...BASE, depth: 100 });
-      runCase('G 雾色改红', { ...BASE, color: '#ff0000' });
-      runCase('H 动态 t=0', { ...BASE, dynamic: true, noiseStrength: 40 }, 0);
-      runCase('I 动态 t=6', { ...BASE, dynamic: true, noiseStrength: 40 }, 6);
-
-      DIAG.push('着色器诊断：' + (() => {
-        const bad = renderer.info.programs.map((p) => p.diagnostics).filter(Boolean);
-        return bad.length
-          ? bad.map((d) => (d.programLog || '') + ' :: ' + ((d.fragmentShader && d.fragmentShader.log) || '')).join(' | ').slice(0, 500)
-          : '无错误';
-      })());
-
-      /* ---------- 第二段：竖直面上的噪声沿高度是否有变化 ---------- */
-      // 用同一张贴图直接算，模拟三种取法（不依赖渲染，结论直接可比）
-      const c2 = document.createElement('canvas');
-      c2.width = noise.image.width; c2.height = noise.image.height;
-      const cx2 = c2.getContext('2d');
-      cx2.drawImage(noise.image, 0, 0);
-      const px2 = cx2.getImageData(0, 0, c2.width, c2.height).data;
-      const tex2 = (u, v) => {
-        const x = ((Math.floor(u * c2.width) % c2.width) + c2.width) % c2.width;
-        const y = ((Math.floor(v * c2.height) % c2.height) + c2.height) % c2.height;
-        return px2[(y * c2.width + x) * 4];
       };
-      const scale = 0.06;
-      const oldVals = [], newVals = [];
-      for (let i = 0; i <= 200; i++) {
-        const y = -8 + (16 * i) / 200;      // 模型的竖直范围
-        // 老做法（0.5 第一版）：uv = world.xz * scale —— z 固定，沿高度完全不变
-        oldVals.push(tex2(0, 0));
-        // 新做法：三维 —— 按世界 y 分成"层"，层间插值
-        const pz = y * scale;
-        const z0 = Math.floor(pz);
-        const fz = pz - z0;
-        const a = tex2(z0 * 0.137, z0 * 0.317);
-        const b = tex2((z0 + 1) * 0.137, (z0 + 1) * 0.317);
-        newVals.push(Math.round(a + (b - a) * fz));
-      }
-      const spanOf = (arr) => Math.max(...arr) - Math.min(...arr);
-      const stepOf = (arr) => {
-        let s = 0;
-        for (let i = 1; i < arr.length; i++) s += Math.abs(arr[i] - arr[i - 1]);
-        return +(s / (arr.length - 1)).toFixed(3);
+
+      // 板在 z=-100 且 depth=100、过渡带 5 → 90..110 正好卡住 → depthMixer≈0.5
+      setPlate(100, { enabled: false });        shotA('P1 关雾（板距离 100）');
+      setPlate(100, { enabled: true });         shotA('P2 开雾（板距离 100）');
+      setPlate(100, { enabled: false });        shotA('P3 再关雾');
+      // 高度项：同一块板，把雾面放在它**之下**（两项都归零 → 完全没有雾）与**之上**
+      // （只剩深度项那一半）。两者必须差得出来，否则说明 height 没生效。
+      // 前两版写法都不行：把雾面抬到"满屏板之上"要先知道板的世界 Y 跨度（由相机视野决定，
+      // 取样点落在哪一侧说不清）；改用两块板又会互相遮挡、还容易出画。
+      setPlate(100, { enabled: true, height: -300, depth: 100 });
+      shotA('P4 雾面在板之下（无雾）');
+      setPlate(100, { enabled: true, height: 300, depth: 100 });
+      shotA('P4b 雾面在板之上（只剩深度项）');
+      // 深度项：depth 拉到 2000 → 只有高度项那 *.5；压到 20 → 距离项吃满
+      setPlate(100, { enabled: true, height: 40, depth: 2000 });  shotA('P5 深度 2000（无距离雾）');
+      setPlate(100, { enabled: true, height: 40, depth: 20 });    shotA('P6 深度 20（距离雾吃满）');
+      // 雾色改红：确认注入的确实是 uFogColor 这个 uniform
+      setPlate(100, { enabled: true, height: 40, depth: 20, color: '#ff0000' }); shotA('P7 雾色改红');
+      // 板挪近：同一套参数下，近处不该比远处亮（深度项的方向）
+      setPlate(20, { enabled: true, height: 40, depth: 100 });    shotA('P8 板距离 20');
+      setPlate(100, { enabled: true, height: 40, depth: 100 });   shotA('P9 板距离 100');
+
+      /* ================= 第二段：天穹 ================= */
+      // 没有地面了，所以画面里除了天穹什么都没有 —— 反而更好验证：
+      // 每个像素都直接反映天穹的渐变。相机必须待在天穹球内（半径见 src/sky-dome.js）。
+      const sceneB = new THREE.Scene();
+      const cameraB = new THREE.PerspectiveCamera(50, 1, 0.1, 4000);
+      cameraB.position.set(0, 5, 55);
+      cameraB.lookAt(0, 0, 0);
+      const dome = createSkyDome();
+      sceneB.add(dome.dome);
+      const fogB = createFog(sceneB, dome);
+
+      // 取样：画面上方 1/6（天穹上部）与下方 1/6（天穹下部）
+      const shotB = (label) => {
+        dome.followCamera(cameraB);
+        renderer.render(sceneB, cameraB);
+        gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+        const rgbOf = (y0, y1) => [0, 1, 2].map((c) => {
+          let s = 0, n = 0;
+          for (let y = y0; y < y1; y++) for (let x = 6; x < W - 6; x++) { s += buf[(y * W + x) * 4 + c]; n++; }
+          return (s / n).toFixed(0);
+        }).join('/');
+        OUT.push({
+          seg: 'B', label,
+          skyTop: mean(6, H - 14, W - 6, H - 4),   // 天穹上部（该是 bgTop）
+          skyBottom: mean(6, 4, W - 6, 14),        // 天穹下部（该是雾色）
+          rgb: rgbOf(H - 14, H - 4),
+          all: mean(4, 4, W - 4, H - 4),           // 全屏均值：雾面越高，天穹越白 → 越亮
+        });
       };
+      const setDome = (s) => fogB.update({ color: '#ffffff', bgMode: 'dome', bgTop: '#000000',
+        height: 5, smoothness: 3, depth: 70, depthSmoothness: 25, ...s }, []);
+      setDome({});                 shotB('D1 天穹（雾面 5）');
+      setDome({ height: 300 });    shotB('D2 天穹（雾面 300，分界上移）');
+      setDome({ height: -300 });   shotB('D3 天穹（雾面 -300，分界下移）');
+      setDome({ bgMode: 'flat', bgColor: '#000000' }); shotB('D4 背景改纯黑');
+      setDome({ bgMode: 'dome', bgTop: '#ff0000' });   shotB('D5 天穹顶部改红');
+      setDome({ height: -2000 });  shotB('D6 天穹（雾面 -2000，全黑）');
+
+      DIAG.push('FOG_DEFAULTS=' + JSON.stringify(FOG_DEFAULTS));
 
       renderer.dispose();
-      sceneRt.dispose();
-      outRt.dispose();
-      return JSON.stringify({
-        out: OUT,
-        diag: DIAG,
-        vertical: { oldSpan: spanOf(oldVals), oldStep: stepOf(oldVals), newSpan: spanOf(newVals), newStep: stepOf(newVals) },
-      });
+      return JSON.stringify({ out: OUT, diag: DIAG });
     })()
   `);
 
@@ -297,36 +224,45 @@ try {
     console.log('  页面执行失败:', result);
     failures++;
   } else {
-    const { out, diag, vertical } = JSON.parse(result);
+    const { out, diag } = JSON.parse(result);
     for (const d of diag ?? []) console.log('  [diag] ' + d);
     for (const r of out) {
-      console.log(`  ${r.label.padEnd(22)} 背景=${String(r.bg).padStart(6)}  远处的板=${String(r.plate).padStart(6)}  全屏=${String(r.all).padStart(6)}  背景RGB=${r.rgb}`);
+      console.log(r.seg === 'A'
+        ? `  ${r.label.padEnd(26)} 板色=${String(r.val).padStart(6)} 角=${String(r.corner).padStart(3)}  ${r.u}`
+        : `  ${r.label.padEnd(26)} 天上=${String(r.skyTop).padStart(6)}  天下=${String(r.skyBottom).padStart(6)} 上部RGB=${r.rgb}`);
     }
     const g = (k) => out.find((r) => r.label.startsWith(k));
-    const [A, B, C, D, E, F, G, H, I] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'].map(g);
+    const [P1, P2, P3, P4, P4b, P5, P6, P7, P8, P9] = ['P1', 'P2', 'P3', 'P4 ', 'P4b', 'P5', 'P6', 'P7', 'P8', 'P9'].map(g);
+    const [D1, D2, D3, D4, D5, D6] = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6'].map(g);
 
-    console.log('\n--- 第一段：雾是**全局**的（能染到没有几何的背景）---');
-    ok('基准：关雾时背景是纯黑', A.bg < 3, `背景 ${A.bg}`);
-    ok('开雾后背景被染（材质注入做不到这点）', B.bg > A.bg + 40, `关雾 ${A.bg} → 开雾 ${B.bg}`);
-    ok('远处的板同时被染', B.plate > A.plate + 20, `${A.plate} → ${B.plate}`);
-    ok('雾面压到画面之上 → 没有雾（回到基准）', Math.abs(C.bg - A.bg) < 3, `背景 ${C.bg}（关雾 ${A.bg}）`);
-    ok('雾面抬高 → 同一块板更亮（雾更浓）', D.plate > B.plate + 5, `雾面 0: ${B.plate} → 雾面 8: ${D.plate}`);
-    ok('深度项：depth 变小 → 同一块板更亮', E.plate > F.plate + 5, `depth 45: ${E.plate} vs depth 100: ${F.plate}`);
-    ok('雾色是 uniform：改红后背景只剩红通道', Number(G.rgb.split('/')[0]) > 150
-      && Number(G.rgb.split('/')[1]) < 20 && Number(G.rgb.split('/')[2]) < 20,
-      `背景 RGB ${G.rgb}`);
+    console.log('\n--- 第一段：雾确实改变了材质画面 ---');
+    ok('基准：关雾时板是纯灰（无干扰）', P1.val > 75 && P1.val < 85, `板色 ${P1.val}`);
+    ok('可复现：关雾两次结果一致', Math.abs(P1.val - P3.val) < 0.5, `${P1.val} vs ${P3.val}`);
+    ok('开雾后板明显变亮', P2.val > P1.val + 15, `${P1.val} → ${P2.val}`);
+    ok('雾色是 uniform（改红后红通道升）', P7.val > 90, `板色(红通道) ${P7.val}`);
+    // 板的世界 Y 跨度随距离变化（距离 d 时约 ±0.47d），所以"抬到板之上"要按最远那块板算
+    ok('高度项：雾面在板之下 → 完全没有雾', Math.abs(P4.val - P1.val) < 12,
+      `板色 ${P4.val}（关雾 ${P1.val}）`);
+    ok('高度项：雾面在板之上 → 只剩深度项那一半（和无雾分得开）', P4b.val > P4.val + 40,
+      `雾面在下 ${P4.val} → 雾面在上 ${P4b.val}`);
+    ok('深度项：depth 拉到 2000 → 距离雾归零（只剩高度项那一半）', P5.val < P2.val - 15,
+      `depth 20: ${P6.val} → depth 2000: ${P5.val}`);
+    ok('depth 越小，板越白（距离雾吃满）', P6.val > P5.val + 15, `${P5.val} → ${P6.val}`);
+    ok('同一参数下近处的板不比远处亮（深度项方向没反）', P8.val <= P9.val + 2,
+      `距离 20: ${P8.val} → 距离 100: ${P9.val}`);
 
-    console.log('\n--- 第二段：竖直面不再被拉成条 ---');
-    console.log(`     老做法（只有 xz）：沿高度值域跨度 ${vertical.oldSpan}，相邻变化 ${vertical.oldStep}`);
-    console.log(`     新做法（三维）    ：沿高度值域跨度 ${vertical.newSpan}，相邻变化 ${vertical.newStep}`);
-    ok('老做法沿高度完全不变（这就是"一条一条"的来源）', vertical.oldSpan === 0, String(vertical.oldSpan));
-    ok('三维噪声沿高度有明显变化', vertical.newSpan > 20, String(vertical.newSpan));
-
-    console.log('\n--- 第三段：动态雾随时间改变画面 ---');
-    ok('时间推进 → 画面改变（噪声在流动）', Math.abs(I.plate - H.plate) > 0.3,
-      `t=0 板 ${H.plate} → t=6 板 ${I.plate}`);
+    console.log('\n--- 第二段：天穹是背景（顶深底白，跟着雾面走）---');
+    ok('天穹上部是 bgTop（深色）', D1.skyTop < 20, `天上 ${D1.skyTop}（RGB ${D1.rgb}）`);
+    ok('天穹下部是雾色（白）', D1.skyBottom > 200, `天下 ${D1.skyBottom}`);
+    // 雾面越高 → 天穹越白 → 全屏越亮。这条判据不依赖取样点落在分界的哪一侧，最不容易写错。
+    ok('雾面越高，天穹越白（全屏均值单调上升）',
+      D1.all < D2.all && D6.all <= D3.all && D3.all < D1.all,
+      `-2000: ${D6.all} / -300: ${D3.all} < 5: ${D1.all} < 300: ${D2.all}`);
+    ok('背景切纯黑后天空是黑的（天穹被隐藏）', D4.all < 10, `全屏 ${D4.all}`);
+    ok('bgTop 控制天穹顶部颜色', D5.skyTop > D1.skyTop + 100 && D5.rgb.startsWith('255/'),
+      `天上 ${D1.skyTop} → ${D5.skyTop}（RGB ${D5.rgb}）`);
+    ok('没有地面时，天穹自己铺满整个画面', D1.all > 5, `全屏 ${D1.all}`);
   }
-  if (logs.length) console.log('  [页面错误] ' + logs.slice(0, 3).join(' | '));
 } catch (err) {
   failures++;
   console.log('  [FAIL] 探测过程出错:', err.message);
@@ -334,5 +270,5 @@ try {
   cleanup();
 }
 
-console.log(`\n${failures ? `存在 ${failures} 个失败项` : '雾像素验证通过：全局生效、竖直面无条带、参数与时间都确实改变画面'}\n`);
+console.log(`\n${failures ? `存在 ${failures} 个失败项` : '雾像素验证通过：高度项与深度项都确实改变了画面'}\n`);
 process.exitCode = failures ? 1 : 0;

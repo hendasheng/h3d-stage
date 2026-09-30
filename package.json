@@ -1,7 +1,7 @@
 {
   "name": "h3d-stage",
   "private": true,
-  "version": "0.5.0-dev",
+  "version": "0.4.0-dev",
   "type": "module",
   "description": "h3d-stage —— Houdini 产出的 3D 模型接入 three.js，用于实时交互演出场景（OSC 信号驱动后续接入）",
   "scripts": {
@@ -17,8 +17,7 @@
     "test:smoke": "node tools/smoke-dev.mjs",
     "probe:glow": "node tools/probe-glow-cdp.mjs",
     "probe:fog": "node tools/probe-fog-pixels.mjs",
-    "gen:noise": "node tools/gen-noise-texture.mjs",
-    "check": "node tools/validate.mjs && node tools/gen-noise-texture.mjs --check && npm run test:glow && npm run test:environment && npm run test:fog && npm run test:shadows && npm run test:explode && npm run test:smoke"
+    "check": "node tools/validate.mjs && npm run test:glow && npm run test:environment && npm run test:fog && npm run test:shadows && npm run test:explode && npm run test:smoke"
   },
   "dependencies": {
     "@preact/signals": "^2.11.2",

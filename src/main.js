@@ -10,17 +10,13 @@ import * as THREE from 'three';
 import { render, h } from 'preact';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createEnvironmentLighting } from './environment.js';
-import { createFog, FOG_DEFAULTS } from './fog.js';
-import { FOG_PASS_SHADER, bindFogCamera } from './fog-pass.js';
-import { createFogDepthPass } from './fog-depth.js';
-import { getFogNoiseTexture } from './fog-texture.js';
+import { createFog } from './fog.js';
 import { createSkyDome } from './sky-dome.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { configureKeyShadow, setSelfShadows, setShadowSoftness } from './shadows.js';
 import { App } from './ui/App.jsx';
@@ -51,7 +47,7 @@ const GRID_SIZE = 40;       // 世界网格边长（同时作为格数 → 每�
 let renderer, scene, camera, controls, modelRoot, centerGroup, raycaster, worldGrid;
 let keyLight;
 let environmentLighting;
-let composer, bloomPass, gtaoPass, fogPass, fogCamera, fogDepthPass;
+let composer, bloomPass, gtaoPass;
 let fog;   // 由 createFog(scene, skyDome) 创建，见 src/fog.js
 let skyDome;   // 渐变天穹（背景），见 src/sky-dome.js
 const auxiliaryLights = [];
@@ -66,7 +62,6 @@ let classMaterials = new Map();   // class 编号 → 该 class 的材质列表�
 // 注意：必须在使用前声明 —— signal.subscribe() 会立刻同步触发回调，
 // 若声明写在后面会命中暂时性死区（TDZ）直接抛错。
 let lastExplode = 0;
-let lastFrameTime = 0;   // 上一帧时间戳（ms），用来算动态雾的 dt
 // 模型就绪前忽略 UI 触发的重建，否则 subscribe 的立即回调会拿着空场景去拆部件
 let ready = false;
 
@@ -206,27 +201,12 @@ async function loadModel(file) {
       scene: () => scene,
       camera: () => camera,
       renderer: () => renderer,
-      composer: () => composer,
-      fogPass: () => fogPass,
-      /** 调试：把雾 pass 的 tDepth 直接当颜色输出（判断深度纹理有没有数据） */
-      showDepth(enabled) {
-        if (!fogPass) return 'no pass';
-        if (!fogPass.userData.__origFrag) fogPass.userData.__origFrag = fogPass.material.fragmentShader;
-        fogPass.material.fragmentShader = enabled
-          ? 'uniform sampler2D tDepth;\nvarying vec2 vUv;\nvoid main(){ float d = texture2D(tDepth, vUv).x; gl_FragColor = vec4(d, d, d, 1.0); }'
-          : fogPass.userData.__origFrag;
-        fogPass.material.needsUpdate = true;
-        return enabled ? 'depth view on' : 'depth view off';
-      },
-      fog,
-      store,
       fogInfo: () => ({
         sceneFog: scene.fog ? { near: scene.fog.near, far: scene.fog.far, color: '#' + scene.fog.color.getHexString() } : null,
         background: scene.background?.isColor ? '#' + scene.background.getHexString() : (scene.background ? 'texture' : null),
-        passAttached: !!fogPass,
+        attached: store.parts.filter((p) => p.material?.userData?.__fogAttached).length,
         domeVisible: skyDome?.dome?.visible ?? false,
         parts: store.parts.length,
-        time: fog?.time ?? 0,
       }),
     };
   }
@@ -308,8 +288,8 @@ function initThree() {
   skyDome = createSkyDome();
   scene.add(skyDome.dome);
 
-  // 雾：由全屏后期 pass 完成（见下方 composer），这里先建管理器（背景/天穹/参数）
-  fog = createFog(scene, skyDome, null, camera);
+  // 雾（材质注入）
+  fog = createFog(scene, skyDome);
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
@@ -341,32 +321,8 @@ function initThree() {
   raycaster = new THREE.Raycaster();
 
   // 标准场景后期：先在 HDR 中生成辉光，最后统一做色调映射与颜色空间转换。
-  //
-  // 雾走**全屏后期**（不是材质注入）：它需要场景深度来重建每个像素的世界坐标。
-  //
-  // **深度必须来自独立的预渲染**（见 src/fog-depth.js）。曾试着给 composer 的 render
-  // target 挂一张 `DepthTexture` 让雾读，结果撞上 WebGL 的硬限制：
-  //   `GL_INVALID_OPERATION: Feedback loop formed between Framebuffer and active Texture`
-  // 因为雾输出的那个 framebuffer，其深度附件正是它采样的纹理。这不是参数问题，
-  // 是 API 禁止的，那次绘制会被直接丢弃（画面就是"雾没生效/整屏乱闪"）。
-  //
-  // 顺序：深度预渲染 → RenderPass → 雾 → GTAO → 辉光 → OutputPass。
-  // 雾紧跟场景颜色之后，读到的是刚渲染完的颜色；深度来自那趟独立预渲染。
-  const search = typeof location !== 'undefined' ? (location.search ?? '') : '';
-  const noFogPass = new URLSearchParams(search).has('nofog');   // 逃生开关，见下
-
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
-
-  if (!noFogPass) {
-    fogDepthPass = createFogDepthPass(innerWidth, innerHeight);
-    fogPass = new ShaderPass(FOG_PASS_SHADER);
-    fogPass.uniforms.tDepth.value = fogDepthPass.texture;
-    // 相机矩阵必须自己传（ShaderMaterial 拿不到 three 的内建矩阵），并且每帧刷新
-    fogCamera = bindFogCamera(fogPass.material, camera, () => fogDepthPass?.texture);
-    composer.addPass(fogPass);
-  }
-
   gtaoPass = new GTAOPass(scene, camera, innerWidth, innerHeight);
   gtaoPass.blendIntensity = store.gtaoIntensity.value;
   gtaoPass.updateGtaoMaterial({ radius: store.gtaoRadius.value, thickness: 1 });
@@ -379,38 +335,23 @@ function initThree() {
   composer.addPass(bloomPass);
   composer.addPass(new OutputPass());
 
-  // 把 pass 交给雾管理器，并把噪声贴图与当前参数灌进去
-  fog.attachPass(fogPass);
-  fog.update({ noiseTexture: getFogNoiseTexture() });
-  applyFogCurrent();
-
   window.addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
     composer.setSize(innerWidth, innerHeight);
     gtaoPass.setSize(innerWidth, innerHeight);
-    fogDepthPass?.setSize(innerWidth, innerHeight);
   });
   renderer.domElement.addEventListener('pointerdown', onPointerDown);
   renderer.domElement.addEventListener('pointermove', onPointerMove);
   renderer.setAnimationLoop(tick);
 }
 
-function tick(now = 0) {
+function tick() {
   if (store.spin.value && modelRoot) modelRoot.rotation.y += 0.0025;
   controls.update();
   // 天穹每帧跟随相机：半径远小于远裁剪面，不跟随就会"走出天空"
   skyDome?.followCamera(camera);
-  // 相机一动，从深度反推世界坐标用的矩阵就得跟着更新，否则雾会错位
-  fogCamera?.update();
-
-  // 动态雾：用真实经过的时间推进流动，与帧率无关。
-  // 首帧没有上一帧时间戳（now 可能是 0），跳过以免产生一个巨大的 dt。
-  if (lastFrameTime && now > lastFrameTime) {
-    fog?.tick(Math.min((now - lastFrameTime) / 1000, 0.1));   // 封顶 0.1s：切标签页回来不要跳一大步
-  }
-  lastFrameTime = now;
   let needRender = true;
 
   // 只要曾经炸开过就继续调用 —— 包括 factor 归零那一帧，
@@ -424,10 +365,6 @@ function tick(now = 0) {
   if (glowActiveCount()) updateGlow();
 
   if (needRender) {
-    // 深度预渲染必须在场景颜色**之前**跑：它把深度写进一张独立的纹理，
-    // 雾 pass 之后采它 —— 两者不在同一个 framebuffer 上，才不会触发
-    // WebGL 的 "feedback loop between framebuffer and active texture"。
-    if (fogDepthPass && store.fogEnabled.value) fogDepthPass.render(renderer, scene, camera);
     if (store.bloomEnabled.value) composer.render();
     else renderer.render(scene, camera);
   }
@@ -563,9 +500,7 @@ function initControlsWiring() {
   const applyFog = () => applyFogCurrent();
   for (const sig of [store.fogEnabled, store.fogColor, store.fogBgMode,
     store.fogBgColor, store.fogBgTop, store.fogBgBottom,
-    store.fogHeight, store.fogSmoothness, store.fogDepth, store.fogDepthSmoothness,
-    store.fogDynamic, store.fogNoiseStrength, store.fogNoiseScale,
-    store.fogFlowX, store.fogFlowY, store.fogWarp]) {
+    store.fogHeight, store.fogSmoothness, store.fogDepth, store.fogDepthSmoothness]) {
     sig.subscribe(applyFog);
   }
   // subscribe 的回调会立即同步执行一次；模型没加载完之前不要真的重建
@@ -638,6 +573,7 @@ async function buildParts() {
 
   applyColors();
   setWireframe(store.parts, store.wireframe.value);
+  // 新模型的材质是新的：竖直分层雾需要重新注入（线性雾不用）
   applyFogCurrent();
   classMaterials = buildClassMaterialIndex(store.parts);   // class → 材质，发光时按编号直取
   glow.clearAll();
@@ -646,13 +582,10 @@ async function buildParts() {
   updateDebug();
 }
 
-/**
- * 用当前 store 里的设置应用一次雾。
- *
- * 注意这里**不再需要传部件列表**：雾是全屏后期 pass，与模型材质无关，
- * 所以"换了模型要重新注入"这件事不存在了 —— 换模型不影响雾。（0.4 的材质注入才需要。）
- */
+/** 用当前 store 里的设置应用一次雾（buildParts 之后材质变了要重来一次） */
 function applyFogCurrent() {
+  // 只注入模型部件：没有地面之后，判断标准就是"模型本身有没有被雾染"
+  const targets = store.parts;
   fog?.update({
     enabled: store.fogEnabled.value,
     color: store.fogColor.value,
@@ -664,14 +597,7 @@ function applyFogCurrent() {
     smoothness: store.fogSmoothness.value,
     depth: store.fogDepth.value,
     depthSmoothness: store.fogDepthSmoothness.value,
-    // 动态雾（0.5）
-    dynamic: store.fogDynamic.value,
-    noiseStrength: store.fogNoiseStrength.value,
-    noiseScale: store.fogNoiseScale.value,
-    flowX: store.fogFlowX.value,
-    flowY: store.fogFlowY.value,
-    warp: store.fogWarp.value,
-  });
+  }, targets);
 }
 
 /**
