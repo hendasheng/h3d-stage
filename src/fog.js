@@ -78,8 +78,8 @@ export const FOG_DEFAULTS = {
   bgColor: '#000000',      // 纯色背景（默认黑）
   bgTop: '#000000',        // 天穹顶部 / 渐变顶部
   bgBottom: '#ffffff',     // 渐变底部
-  height: -2,              // fogPositionY：雾面高度（低于此处开始起雾）
-  smoothness: 5,           // fogSmoothness：高度过渡带
+  height: 2,               // 雾面在相机**下方**多少（相对相机，与模型尺寸/机位解耦）
+  smoothness: 4,           // 高度过渡带
   depth: 70,               // fogDepth：深度分界距离
   depthSmoothness: 25,     // fogDepthSmoothness：深度过渡带
 
@@ -105,7 +105,7 @@ export const FOG_DEFAULTS = {
  *   本模块只把参数写进它的 uniforms。**刻意做成参数而不是 import**，
  *   这样 `fog.js` 在 Node 测试里能独立加载。
  */
-export function createFog(scene, dome = null, pass = null) {
+export function createFog(scene, dome = null, pass = null, camera = null) {
   const gradient = createGradientBackground();
   scene.background = null;
   scene.fog = null;   // 不用 three 内置雾（它染不到背景，做不到全局）
@@ -120,11 +120,24 @@ export function createFog(scene, dome = null, pass = null) {
    * 注意这里**没有** 0.4 那个"改了值但上传不上去"的坑：
    * 全屏 pass 每帧都重新读一遍 uniform，不需要换 cacheKey、也不需要重编译。
    */
+  /**
+   * 雾面的世界高度 = 相机高度 − settings.height。
+   *
+   * **高度做成相对相机**：参考站用的是世界绝对高度，照搬到本项目就出事 ——
+   * 默认值一旦高于模型（默认 -2 就高于模型底面），模型的每个点都低于雾面，
+   * 于是整块画面（连近处）都被盖上雾，看起来就是"彻底糊掉"。
+   * 相对之后参数与模型尺寸、相机机位解耦：近处永远清晰，往下越远越浓。
+   */
+  function fogPlaneY() {
+    const camY = camera ? camera.position.y : 0;
+    return camY - settings.height;
+  }
+
   function writePass() {
     const u = pass?.uniforms;
     if (!u) return;
     u.uFogColor.value.set(settings.color);
-    u.fogPositionY.value = settings.height;
+    u.fogPositionY.value = fogPlaneY();
     u.fogSmoothness.value = settings.smoothness;
     u.fogDepth.value = settings.depth;
     u.fogDepthSmoothness.value = settings.depthSmoothness;
@@ -161,7 +174,7 @@ export function createFog(scene, dome = null, pass = null) {
       // 不同步的话雾会在天穹上"断掉"，看起来像一堵白墙而不是雾。
       dome?.setVisible(settings.bgMode === 'dome');
       dome?.sync({
-        position: settings.height,
+        position: fogPlaneY(),
         smoothness: settings.smoothness,
         color: settings.color,
         top: settings.bgTop,

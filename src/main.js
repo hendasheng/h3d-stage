@@ -308,7 +308,7 @@ function initThree() {
   scene.add(skyDome.dome);
 
   // 雾：由全屏后期 pass 完成（见下方 composer），这里先建管理器（背景/天穹/参数）
-  fog = createFog(scene, skyDome);
+  fog = createFog(scene, skyDome, null, camera);
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
@@ -364,7 +364,13 @@ function initThree() {
   composer = new EffectComposer(renderer, composerTarget);
   composer.addPass(new RenderPass(scene, camera));
 
-  fogPass = new ShaderPass(FOG_PASS_SHADER);
+  // 逃生开关：`?nofog` 时**完全不建雾 pass**，后期链回到加雾之前的样子。
+  // 排查"画面异常到底是不是雾造成的"用这个，一次就能分开，不用来回猜。
+  // `location` 在 Node（`test:explode` 会 import 本模块）里不存在，所以判一下。
+  const search = typeof location !== 'undefined' ? (location.search ?? '') : '';
+  const noFogPass = new URLSearchParams(search).has('nofog');
+
+  fogPass = noFogPass ? null : new ShaderPass(FOG_PASS_SHADER);
   /**
    * 取"场景深度"那张纹理。
    * 用 getter 而不是固定值：`EffectComposer.setSize()`（窗口缩放）会**重建**这两个 target，
@@ -382,10 +388,12 @@ function initThree() {
     }
     return rt.depthTexture;
   };
-  fogPass.uniforms.tDepth.value = sceneDepthTexture();
-  // 相机矩阵必须自己传（ShaderMaterial 拿不到 three 的内建矩阵），并且每帧刷新
-  fogCamera = bindFogPassCamera(fogPass, camera, sceneDepthTexture);
-  composer.addPass(fogPass);
+  if (fogPass) {
+    fogPass.uniforms.tDepth.value = sceneDepthTexture();
+    // 相机矩阵必须自己传（ShaderMaterial 拿不到 three 的内建矩阵），并且每帧刷新
+    fogCamera = bindFogPassCamera(fogPass, camera, sceneDepthTexture);
+    composer.addPass(fogPass);
+  }
 
   gtaoPass = new GTAOPass(scene, camera, innerWidth, innerHeight);
   gtaoPass.blendIntensity = store.gtaoIntensity.value;

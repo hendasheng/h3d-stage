@@ -72,6 +72,8 @@ export const FOG_PASS_SHADER = {
     fogDepth: { value: 70 },
     fogDepthSmoothness: { value: 25 },
     uFogEnabled: { value: 1 },
+    // 雾量上限：留一点本体颜色，别把画面吃光（参考站是 1.0，实测太糊）
+    uFogMaxMixer: { value: 0.85 },
     uFogNoise: { value: null },
     fogNoiseScale: { value: 0.06 },
     fogNoiseStrength: { value: 6 },
@@ -102,6 +104,7 @@ export const FOG_PASS_SHADER = {
     uniform float fogDepth;
     uniform float fogDepthSmoothness;
     uniform float uFogEnabled;
+    uniform float uFogMaxMixer;
     uniform sampler2D uFogNoise;
     uniform float fogNoiseScale;
     uniform float fogNoiseStrength;
@@ -162,8 +165,15 @@ export const FOG_PASS_SHADER = {
       float distanceToCamera = length(world - cameraPosition);
       float depthMixer = smoothstep(distanceToCamera + fogDepthSmoothness, distanceToCamera - fogDepthSmoothness, fogDepth);
       depthMixer = mix(0.0, depthMixer, verticalMixer);
-      float mixer = clamp(verticalMixer * 0.5 + depthMixer * 0.95, 0.0, 1.0) * uFogEnabled;
-      // mixer 也必须有限，否则 mix 出来是 NaN
+      float mixer = clamp(verticalMixer * 0.5 + depthMixer * 0.95, 0.0, 1.0);
+
+      // **距离衰减**：参考站的公式里高度项是恒定的，于是只要物体低于雾面，
+      // 连近处的表面也会被盖上 50% 白 —— 整幅画面糊成一片，看不出雾的层次。
+      // 让它按到相机的距离渐入：近处几乎不受影响，越远越浓。
+      float nearFade = smoothstep(0.0, max(fogDepth, 1.0), distanceToCamera);
+      mixer *= nearFade;
+      // 再封个顶：留一点本体颜色，雾不该把画面吃光。
+      mixer = min(mixer, uFogMaxMixer) * uFogEnabled;
       if (!(mixer >= 0.0)) mixer = 0.0;
 
       gl_FragColor = vec4(mix(color.rgb, uFogColor, mixer), color.a);

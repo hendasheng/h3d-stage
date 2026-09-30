@@ -63,7 +63,9 @@ function makeFakePass() {
 
 const scene = new THREE.Scene();
 const pass = makeFakePass();
-const fog = createFog(scene, null, pass);
+// 假相机：固定高度 10，方便断言"雾面世界高度 = 相机高度 − height"
+const fakeCamera = { position: new THREE.Vector3(0, 10, 0) };
+const fog = createFog(scene, null, pass, fakeCamera);
 
 console.log('\n=== 1. 创建 ===');
 ok('不再挂内置雾（内置雾染不到背景，做不到全局）', scene.fog === null, String(scene.fog));
@@ -78,8 +80,10 @@ ok('动态雾参数齐备',
   ['noiseStrength', 'noiseScale', 'flowX', 'flowY', 'flowZ', 'warp'].map((k) => `${k}=${FOG_DEFAULTS[k]}`).join(' '));
 
 console.log('\n=== 2. 参数写进 pass 的 uniforms ===');
-fog.update({ enabled: true, height: -7.5, smoothness: 3, depth: 90, depthSmoothness: 12, color: '#ff0000' });
-ok('fogPositionY 写对了', pass.uniforms.fogPositionY.value === -7.5, String(pass.uniforms.fogPositionY.value));
+fog.update({ enabled: true, height: 2.5, smoothness: 3, depth: 90, depthSmoothness: 12, color: '#ff0000' });
+// 高度是**相对相机**的：相机 y=10、height=2.5 → 雾面落在世界 y=7.5
+ok('雾面世界高度 = 相机高度 − height（相对相机）', pass.uniforms.fogPositionY.value === 7.5,
+  String(pass.uniforms.fogPositionY.value));
 ok('fogSmoothness 写对了', pass.uniforms.fogSmoothness.value === 3, String(pass.uniforms.fogSmoothness.value));
 ok('fogDepth 写对了', pass.uniforms.fogDepth.value === 90, String(pass.uniforms.fogDepth.value));
 ok('fogDepthSmoothness 写对了', pass.uniforms.fogDepthSmoothness.value === 12, String(pass.uniforms.fogDepthSmoothness.value));
@@ -97,11 +101,11 @@ fog.update({ enabled: false });
 ok('关雾时 uFogEnabled = 0', pass.uniforms.uFogEnabled.value === 0, String(pass.uniforms.uFogEnabled.value));
 
 console.log('\n=== 3. 多次 update 不重复、可覆盖 ===');
-fog.update({ height: -3 });
-ok('第二次 update 只改这一项，其余保持', pass.uniforms.fogPositionY.value === -3
+fog.update({ height: 7 });
+ok('第二次 update 只改这一项，其余保持', pass.uniforms.fogPositionY.value === 3
   && pass.uniforms.fogSmoothness.value === 3 && pass.uniforms.fogDepth.value === 90,
   `Y=${pass.uniforms.fogPositionY.value} smooth=${pass.uniforms.fogSmoothness.value} depth=${pass.uniforms.fogDepth.value}`);
-ok('settings 快照能读回来', fog.settings.height === -3 && fog.settings.depth === 90,
+ok('settings 快照能读回来', fog.settings.height === 7 && fog.settings.depth === 90,
   JSON.stringify({ height: fog.settings.height, depth: fog.settings.depth }));
 // 后期 pass 每帧重读 uniform，所以**不需要** 0.4 那套"改 cacheKey 强制重编译"的把戏
 ok('没有留下材质注入的痕迹（不再有 attach / detach）',
@@ -127,10 +131,10 @@ console.log('\n=== 5. 天穹同步（背景与雾必须同一分界）===');
     sync: (o) => calls.push(['sync', o.position, o.smoothness, o.color, o.top]),
   };
   const scene2 = new THREE.Scene();
-  const fog2 = createFog(scene2, domeStub);
-  fog2.update({ bgMode: 'dome', color: '#ff8800', height: -5, smoothness: 3, bgTop: '#101010' });
+  const fog2 = createFog(scene2, domeStub, null, fakeCamera);
+  fog2.update({ bgMode: 'dome', color: '#ff8800', height: 5, smoothness: 3, bgTop: '#101010' });
   const sync = calls.find((c) => c[0] === 'sync');
-  ok('天穹拿到与雾相同的 height / smoothness', sync?.[1] === -5 && sync?.[2] === 3, JSON.stringify(sync));
+  ok('天穹拿到与雾同一个分界面（相机 y=10 − height 5 = 5）', sync?.[1] === 5 && sync?.[2] === 3, JSON.stringify(sync));
   ok('天穹底部 = 雾色、顶部 = bgTop', sync?.[3] === '#ff8800' && sync?.[4] === '#101010',
     `${sync?.[3]} / ${sync?.[4]}`);
   calls.length = 0;
@@ -170,11 +174,11 @@ console.log('\n=== 7. attachPass：pass 后到也能接上 ===');
 {
   const scene3 = new THREE.Scene();
   const late = makeFakePass();
-  const fog3 = createFog(scene3, null);          // 先不给 pass
-  fog3.update({ height: -9, depth: 33 });
-  ok('没有 pass 时只记设置', fog3.settings.height === -9, String(fog3.settings.height));
+  const fog3 = createFog(scene3, null, null, fakeCamera);   // 先不给 pass
+  fog3.update({ height: 9, depth: 33 });
+  ok('没有 pass 时只记设置', fog3.settings.height === 9, String(fog3.settings.height));
   fog3.attachPass(late);
-  ok('attachPass 后立刻把当前设置灌进去', late.uniforms.fogPositionY.value === -9
+  ok('attachPass 后立刻把当前设置灌进去（相机 10 − height 9 = 1）', late.uniforms.fogPositionY.value === 1
     && late.uniforms.fogDepth.value === 33,
     `Y=${late.uniforms.fogPositionY.value} depth=${late.uniforms.fogDepth.value}`);
   fog3.dispose();

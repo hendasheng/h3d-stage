@@ -32,8 +32,8 @@ export const store = {
   fogBgColor: signal('#000000'),
   fogBgTop: signal('#000000'),
   fogBgBottom: signal('#ffffff'),
-  fogHeight: signal(-2),          // fogPositionY
-  fogSmoothness: signal(5),       // fogSmoothness
+  fogHeight: signal(2),           // 雾面在相机下方多少（相对相机）
+  fogSmoothness: signal(4),       // 高度过渡带
   fogDepth: signal(70),           // fogDepth
   fogDepthSmoothness: signal(25), // fogDepthSmoothness
   // 动态雾（0.5）：噪声把雾面高度推起来，并且自己流动
