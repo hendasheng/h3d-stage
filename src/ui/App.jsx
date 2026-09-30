@@ -26,6 +26,15 @@ function TweakpaneControls() {
       wireframe: store.wireframe.value,
       spin: store.spin.value,
       showGrid: store.showGrid.value,
+      bloomEnabled: store.bloomEnabled.value,
+      bloomStrength: store.bloomStrength.value,
+      bloomRadius: store.bloomRadius.value,
+      bloomThreshold: store.bloomThreshold.value,
+      environment: store.environment.value,
+      environmentIntensity: store.environmentIntensity.value,
+      lightIntensity: store.lightIntensity.value,
+      shadowSoftness: store.shadowSoftness.value,
+      environmentStatus: store.environmentStatus.value,
       glowInput: Number(store.glowInput.value) || 0,
       glowDuration: store.glowDuration.value,
       glowPeak: store.glowPeak.value,
@@ -42,7 +51,8 @@ function TweakpaneControls() {
     }).on('change', (ev) => { store.model.value = ev.value; });
 
     const fMat = pane.addFolder({ title: '材质', expanded: true });
-    fMat.addBinding(params, 'baseColor', { label: '基础颜色' })
+    // 选色器在控制列内展开，避免默认 popup 被右侧滚动容器裁切而无法点击。
+    fMat.addBinding(params, 'baseColor', { label: '基础颜色', picker: 'inline' })
       .on('change', (ev) => { store.baseColor.value = ev.value; });
     fMat.addBinding(params, 'classColors', { label: 'class 分色' })
       .on('change', (ev) => { store.classColors.value = ev.value; });
@@ -51,6 +61,29 @@ function TweakpaneControls() {
     const fScene = pane.addFolder({ title: '场景', expanded: true });
     fScene.addBinding(params, 'showGrid', { label: '世界网格' })
       .on('change', (ev) => { store.showGrid.value = ev.value; });
+    const environmentBinding = fScene.addBinding(params, 'environment', {
+      label: '环境', options: store.environmentOptions,
+    }).on('change', (ev) => {
+      if (ev.value !== store.environment.value) void store.handlers.selectEnvironment(ev.value);
+    });
+    let environmentOptions = store.environmentOptions;
+    fScene.addBinding(params, 'environmentStatus', { label: 'HDR 状态', readonly: true });
+    fScene.addBinding(params, 'environmentIntensity', { label: '环境亮度', min: 0, max: 5, step: 0.01 })
+      .on('change', (ev) => { store.environmentIntensity.value = ev.value; });
+    fScene.addBinding(params, 'lightIntensity', { label: '辅助灯亮度', min: 0, max: 3, step: 0.01 })
+      .on('change', (ev) => { store.lightIntensity.value = ev.value; });
+    fScene.addBinding(params, 'shadowSoftness', { label: '投影柔化', min: 0, max: 8, step: 0.1 })
+      .on('change', (ev) => { store.shadowSoftness.value = ev.value; });
+
+    const fBloom = fScene.addFolder({ title: '辉光', expanded: true });
+    fBloom.addBinding(params, 'bloomEnabled', { label: '开启' })
+      .on('change', (ev) => { store.bloomEnabled.value = ev.value; });
+    fBloom.addBinding(params, 'bloomStrength', { label: '强度', min: 0, max: 3, step: 0.01 })
+      .on('change', (ev) => { store.bloomStrength.value = ev.value; });
+    fBloom.addBinding(params, 'bloomRadius', { label: '范围', min: 0, max: 1, step: 0.01 })
+      .on('change', (ev) => { store.bloomRadius.value = ev.value; });
+    fBloom.addBinding(params, 'bloomThreshold', { label: '亮度阈值', min: 0, max: 10, step: 0.01 })
+      .on('change', (ev) => { store.bloomThreshold.value = ev.value; });
 
     const fPart = pane.addFolder({ title: '每个部件', expanded: true });
     fPart.addBinding(params, 'explode', { label: '炸开距离', min: 0, max: 2, step: 0.01 })
@@ -60,27 +93,19 @@ function TweakpaneControls() {
     fPart.addBinding(params, 'spin', { label: '自动旋转' })
       .on('change', (ev) => { store.spin.value = ev.value; });
 
-    // 材质驱动：按 class 触发发光（0.3 第一步，测试窗口；接 OSC 后由信号调用同一套接口）
-    const fGlow = pane.addFolder({ title: '发光（测试）', expanded: true });
-
-    // class 编号范围 = **模型的真实最大 class**（0 起算，250 块 → 0~249）。
-    // 不要用临时的超大兜底值：那会成为实际生效的上限（踩过，滑块能拉到 100000）。
-    // 上限只能在 hasClassRange() 为真时创建控件，之前先不建。
+    const fGlow = pane.addFolder({ title: '发光', expanded: true });
     const hasClassRange = () => store.parts.length > 0 && maxClassId() > 0;
     let glowInputBinding = null;
-
     const setGlowInput = (raw) => {
       const max = maxClassId();
-      const v = Math.min(max, Math.max(0, Math.round(Number(raw))));
-      if (!Number.isFinite(v)) return;
-      params.glowInput = v;
-      store.glowInput.value = String(v);
+      const value = Math.min(max, Math.max(0, Math.round(Number(raw))));
+      if (!Number.isFinite(value)) return;
+      params.glowInput = value;
+      store.glowInput.value = String(value);
     };
-
     const ensureGlowInputBinding = () => {
       if (glowInputBinding || !hasClassRange()) return;
       params.glowInput = Math.min(params.glowInput, maxClassId());
-      // 直接写 min/max 数字，别用 ~ 之类的符号（Tweakpane 会把它们换成别的字符）
       glowInputBinding = fGlow.addBinding(params, 'glowInput', {
         label: `class 编号 0-${maxClassId()}`,
         min: 0,
@@ -95,24 +120,11 @@ function TweakpaneControls() {
     fGlow.addButton({ title: '触发' }).on('click', () => {
       store.handlers.triggerGlow?.(params.glowInput);
     });
-    fGlow.addButton({ title: '释放（衰减）' }).on('click', () => {
-      store.handlers.releaseGlow?.(params.glowInput);
-    });
-    fGlow.addButton({ title: '全部释放' }).on('click', () => {
-      store.handlers.releaseAllGlow?.();
-    });
-    fGlow.addButton({ title: '立即熄灭' }).on('click', () => {
-      store.handlers.clearGlow?.();
-    });
-    // 长度：step 1ms。注意 step 会把输入吸附到它的整数倍 ——
-    // 之前用 0.02，输入 0.01 会被吸到 0，而 0 的语义是"持续"，看起来就像"值变没了"。
-    // 0 = 持续；>0 即真实时长（最小可用 0.001 秒）
     fGlow.addBinding(params, 'glowDuration', { label: '长度(秒)', min: 0, max: 5, step: 0.001 })
       .on('change', (ev) => { store.glowDuration.value = ev.value; });
-    // 强度上限放宽到 50：HDR 下高值才有明显过曝/泛光感；步长 0.1 保持可精调
     fGlow.addBinding(params, 'glowPeak', { label: '发光强度', min: 0, max: 50, step: 0.1 })
       .on('change', (ev) => { store.glowPeak.value = ev.value; });
-    fGlow.addBinding(params, 'glowColor', { label: '发光颜色' })
+    fGlow.addBinding(params, 'glowColor', { label: '发光颜色', picker: 'inline' })
       .on('change', (ev) => { store.glowColor.value = ev.value; });
 
     // main.js 通过这个句柄把外部改动同步回面板显示
@@ -126,14 +138,24 @@ function TweakpaneControls() {
         params.wireframe = store.wireframe.value;
         params.spin = store.spin.value;
         params.showGrid = store.showGrid.value;
+        params.bloomEnabled = store.bloomEnabled.value;
+        params.bloomStrength = store.bloomStrength.value;
+        params.bloomRadius = store.bloomRadius.value;
+        params.bloomThreshold = store.bloomThreshold.value;
+        params.environment = store.environment.value;
+        params.environmentStatus = store.environmentStatus.value;
+        params.environmentIntensity = store.environmentIntensity.value;
+        params.lightIntensity = store.lightIntensity.value;
+        params.shadowSoftness = store.shadowSoftness.value;
+        if (environmentOptions !== store.environmentOptions) {
+          environmentOptions = store.environmentOptions;
+          environmentBinding.options = environmentOptions;
+        }
         params.glowDuration = store.glowDuration.value;
         params.glowPeak = store.glowPeak.value;
         params.glowColor = store.glowColor.value;
-
-        // 模型可能刚加载完：此时才建 class 编号控件，并把它钳进真实范围
         ensureGlowInputBinding();
         if (glowInputBinding) setGlowInput(store.glowInput.value);
-
         pane.refresh();
       },
     };
@@ -149,14 +171,23 @@ function TweakpaneControls() {
 /* ================================================================== */
 
 function ModelInfo() {
+  const collapsed = useComputed(() => store.statsCollapsed.value);
   const statsHost = useRef(null);
   const diagHost = useRef(null);
   return (
-    <div class="panel" id="stats">
-      <h3>模型</h3>
-      <div ref={statsHost} id="statsBody" />
-      <h3>结构诊断</h3>
-      <div ref={diagHost} id="diagBody" />
+    <div class={'panel' + (collapsed.value ? ' collapsed' : '')} id="stats">
+      <div class="head" onClick={() => { store.statsCollapsed.value = !collapsed.value; }}>
+        <button class="collapse-btn" title={collapsed.value ? '展开模型信息' : '收起模型信息'}>
+          {collapsed.value ? '▸' : '▾'}
+        </button>
+        <b>模型信息</b>
+      </div>
+      <div class="stats-content">
+        <h3>模型</h3>
+        <div ref={statsHost} id="statsBody" />
+        <h3>结构诊断</h3>
+        <div ref={diagHost} id="diagBody" />
+      </div>
     </div>
   );
 }
@@ -181,7 +212,7 @@ function TitlePanel() {
 }
 
 /* ================================================================== */
-/* 右列：部件列表                                                       */
+/* 左列：部件列表                                                       */
 /* ================================================================== */
 
 function PartsList() {
@@ -261,10 +292,10 @@ export function App() {
         <div id="left">
           <TitlePanel />
           <ModelInfo />
+          <PartsList />
         </div>
         <div id="right">
           <TweakpaneControls />
-          <PartsList />
         </div>
       </div>
     </>
@@ -285,8 +316,17 @@ const COMPONENT_CSS = `
 #title .sub.model { color: var(--text); font-size: 13px; font-weight: 600; margin-top: 7px; }
 #title .sub.key { color: var(--accent); font-size: 12.5px; margin-top: 4px; }
 
+/* ---------- 模型信息 ---------- */
+#stats { display: flex; flex: 0 1 46%; min-height: 42px; overflow: hidden; padding: 0; }
+#stats .head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; flex: none; cursor: pointer; }
+#stats:not(.collapsed) { flex-direction: column; }
+#stats:not(.collapsed) .head { border-bottom: 1px solid var(--line); }
+#stats .stats-content { flex: 1; min-height: 0; overflow-y: auto; padding: 0 12px 12px; }
+#stats.collapsed { flex: none; }
+#stats.collapsed .stats-content { display: none; }
+
 /* ---------- 部件列表 ---------- */
-#parts { display: flex; flex-direction: column; overflow: hidden; flex: 1; min-height: 0; max-height: 460px; }
+#parts { display: flex; flex-direction: column; overflow: hidden; flex: 1 1 0; min-height: 44px; max-height: none; }
 #parts .head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; flex: none; white-space: nowrap; cursor: pointer; }
 #parts:not(.collapsed) .head { border-bottom: 1px solid var(--line); }
 #parts .head .hint { margin: 0; font-size: 11px; }
@@ -298,7 +338,7 @@ const COMPONENT_CSS = `
 }
 .collapse-btn:hover { color: var(--text); border-color: #3b4757; }
 
-/* 收起：整块缩成小胶囊，宽度也跟着收 */
+/* 收起：列表缩成小胶囊，宽度也跟着收 */
 #parts.collapsed { flex: none; width: fit-content; align-self: flex-start; border-radius: 999px; }
 #parts.collapsed .tools, #parts.collapsed #partlist, #parts.collapsed .head .hint { display: none; }
 #parts.collapsed .head { padding: 6px 12px; gap: 6px; }

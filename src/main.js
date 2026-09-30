@@ -9,8 +9,13 @@ import './base.css';
 import * as THREE from 'three';
 import { render, h } from 'preact';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { createEnvironmentLighting } from './environment.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { configureKeyShadow, setSelfShadows, setShadowSoftness } from './shadows.js';
 import { App } from './ui/App.jsx';
 import { store, setInfo, setDebug, setSelection, touch } from './ui/store.js';
 import { parseGLBBuffers } from './demo-glb.js';
@@ -37,6 +42,10 @@ const MAX_PARTS = 2000;
 const GRID_SIZE = 40;       // 世界网格边长（同时作为格数 → 每格 1 单位）
 
 let renderer, scene, camera, controls, modelRoot, centerGroup, raycaster, worldGrid;
+let keyLight;
+let environmentLighting;
+let composer, bloomPass;
+const auxiliaryLights = [];
 let source = null;          // parseGLBBuffers 的结果
 let sourceMesh = null;      // three.js 侧的基准 Mesh
 let sourceScene = null;     // 加载出来的 gltf.scene
@@ -104,6 +113,7 @@ async function loadModel(file) {
   const center = box.getCenter(new THREE.Vector3());
   modelRadius = Math.max(size.length() * 0.5, 1);
   sourceScene.position.sub(center);
+  configureKeyShadow(keyLight, modelRadius);
 
   modelRoot = new THREE.Group();
   modelRoot.add(sourceScene);
@@ -237,12 +247,20 @@ function initThree() {
   renderer = new THREE.WebGLRenderer({ canvas: $('view'), antialias: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setSize(innerWidth, innerHeight);
+  renderer.shadowMap.enabled = true;
+  // PCF 支持 shadow.radius，因此可以让右侧控件实时调节阴影软硬。
+  renderer.shadowMap.type = THREE.PCFShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
 
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0d1014);
-  scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+  environmentLighting = createEnvironmentLighting(renderer, scene, ({ current, status, options }) => {
+    store.environment.value = current;
+    store.environmentStatus.value = status;
+    store.environmentOptions = options;
+    store.ui?.syncParams();
+  });
 
   camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.05, 4000);
   camera.position.set(14, 9, 16);
@@ -251,13 +269,17 @@ function initThree() {
   controls.enableDamping = true;
   controls.dampingFactor = 0.07;
 
-  scene.add(new THREE.HemisphereLight(0xa8c4ff, 0x14171c, 1.1));
-  const key = new THREE.DirectionalLight(0xffffff, 1.9);
-  key.position.set(9, 16, 11);
-  scene.add(key);
+  const hemisphere = new THREE.HemisphereLight(0xa8c4ff, 0x14171c, 1.1);
+  scene.add(hemisphere);
+  keyLight = new THREE.DirectionalLight(0xffffff, 1.9);
+  keyLight.position.set(9, 16, 11);
+  keyLight.target.position.set(0, 0, 0);
+  setShadowSoftness(keyLight, store.shadowSoftness.value);
+  scene.add(keyLight, keyLight.target);
   const fill = new THREE.DirectionalLight(0x88aaff, 0.7);
   fill.position.set(-11, 6, -9);
   scene.add(fill);
+  auxiliaryLights.push([hemisphere, 1.1], [keyLight, 1.9], [fill, 0.7]);
 
   centerGroup = new THREE.Group();
   scene.add(centerGroup);
@@ -270,10 +292,21 @@ function initThree() {
 
   raycaster = new THREE.Raycaster();
 
+  // 标准场景后期：先在 HDR 中生成辉光，最后统一做色调映射与颜色空间转换。
+  composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(innerWidth, innerHeight),
+    store.bloomStrength.value, store.bloomRadius.value, store.bloomThreshold.value,
+  );
+  composer.addPass(bloomPass);
+  composer.addPass(new OutputPass());
+
   window.addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
+    composer.setSize(innerWidth, innerHeight);
   });
   renderer.domElement.addEventListener('pointerdown', onPointerDown);
   renderer.domElement.addEventListener('pointermove', onPointerMove);
@@ -295,7 +328,10 @@ function tick() {
   // 材质驱动：每帧按时间戳算各 class 的发光强度（与帧率无关），并写进材质
   if (glowActiveCount()) updateGlow();
 
-  if (needRender) renderer.render(scene, camera);
+  if (needRender) {
+    if (store.bloomEnabled.value) composer.render();
+    else renderer.render(scene, camera);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -394,6 +430,7 @@ export function shouldUpdateExplode(explode, prevExplode) {
 /* ================================================================== */
 
 function wireHandlers() {
+  store.handlers.selectEnvironment = (id) => environmentLighting.select(id);
   store.handlers.select = (index) => select(index);
   // 发光测试窗口（0.3 第一步；接 OSC 后由信号直接调 triggerGlow/releaseGlow）
   store.handlers.triggerGlow = (classId) => triggerGlow(classId);
@@ -412,6 +449,14 @@ function applyColors() {
 }
 
 function initControlsWiring() {
+  store.bloomStrength.subscribe((value) => { bloomPass.strength = value; });
+  store.bloomRadius.subscribe((value) => { bloomPass.radius = value; });
+  store.bloomThreshold.subscribe((value) => { bloomPass.threshold = value; });
+  store.environmentIntensity.subscribe((value) => { scene.environmentIntensity = value; });
+  store.lightIntensity.subscribe((value) => {
+    for (const [light, base] of auxiliaryLights) light.intensity = base * value;
+  });
+  store.shadowSoftness.subscribe((value) => { setShadowSoftness(keyLight, value); });
   // subscribe 的回调会立即同步执行一次；模型没加载完之前不要真的重建
   store.model.subscribe((file) => {
     if (file && file !== store.info.value.model) void loadModel(file);
@@ -477,6 +522,7 @@ async function buildParts() {
   // 部件都是按原始几何单独生成的，所以原始网格始终隐藏
   sourceScene.visible = false;
   sourceScene.rotation.set(0, 0, 0);
+  setSelfShadows(store.parts);
   for (const p of store.parts) centerGroup.add(p.object);
 
   applyColors();

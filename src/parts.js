@@ -322,11 +322,8 @@ export function buildClassMaterialIndex(parts) {
 /**
  * 把一个 class 的材质设为发光。
  *
- * 关键：**把"颜色 × 强度"整体写进 emissive，emissiveIntensity 固定为 1**。
- * 若反过来（emissive = 归一化颜色、emissiveIntensity = 大数值），比如橙 #ff8800 配强度 50，
- * 线性空间会得到 (50, 12.3, 0) —— 通道一起溢出，色相被压成白，只有衰减到低强度才显色（踩过）。
- * 写成 emissive = color × intensity 则超过 1 的通道仍走 tonemapping 泛白，
- * 色相在中间强度区间得以保留。
+ * 把颜色 × 强度写进 emissive，emissiveIntensity 固定为 1。
+ * 这与用 emissiveIntensity 相乘数学等价，不能避免 ACES 下高强度褪色。
  *
  * @param {Map<number, THREE.Material[]>} index 来自 buildClassMaterialIndex
  * @param {number} classId

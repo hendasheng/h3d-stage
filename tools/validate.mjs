@@ -112,16 +112,16 @@ ok('class 分色覆盖全部 250 块', new Set(all).size > 200, `${new Set(all).
 applyColorMode(byClass.parts, false, paletteColor, '#9aa3ad');
 ok('关掉分色后能回到中性色', byClass.parts[0].material.color.getHexString() === '9aa3ad');
 
-console.log('\n=== 5b. 发光写入材质（颜色 × 强度，保色相）===');
+console.log('\n=== 5b. 发光颜色传递与归零 ===');
 const glowIndex = buildClassMaterialIndex(byClass.parts);
-// 用与界面一致的默认峰值，避免默认值改动后测试失真
+// 用界面允许的最大强度检查 HDR 颜色传递。
 const PEAK = 50;
 const gm = glowIndex.get(137)[0];
 
 setClassGlow(glowIndex, 137, 0, PEAK, '#ff8800');
 ok('强度 0 时 emissive 为黑（等于基础材质）', gm.emissive.getHexString() === '000000', gm.emissive.getHexString());
 
-// 关键：颜色不能归一化后交给 emissiveIntensity —— 那样中间强度会全通道溢出而变白
+// CPU 材质值只能验证颜色传递，不能证明屏幕颜色正确。
 // 注意 three 默认开启颜色管理，emissive 存的是**线性空间**值，所以期望值也要按线性算
 setClassGlow(glowIndex, 137, 1, PEAK, '#ff8800');
 const c137 = gm.emissive.clone();

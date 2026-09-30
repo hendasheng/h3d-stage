@@ -20,6 +20,8 @@ export class WebGLRenderer {
     this.__isStub = true;
   }
   setPixelRatio() {}
+  getPixelRatio() { return 1; }
+  getSize(target) { return target.set(1280, 800); }
   setSize() {}
   setAnimationLoop() {}
   render() {}

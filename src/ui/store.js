@@ -17,14 +17,28 @@ export const store = {
   wireframe: signal(false),
   spin: signal(true),
   showGrid: signal(false),        // 世界网格（GridHelper）显隐
+  bloomEnabled: signal(true),
+  bloomStrength: signal(0.1),
+  bloomRadius: signal(0.2),
+  bloomThreshold: signal(1.5),
+  shadowSoftness: signal(3),
+  environment: signal('room'),
+  environmentIntensity: signal(1),
+  lightIntensity: signal(1),      // 原有三盏辅助灯的共同倍率
+  environmentStatus: signal('默认室内'),
+  environmentOptions: [
+    { text: '默认室内', value: 'room' },
+    { text: '关闭环境', value: 'none' },
+  ],
 
   /* ---- 0.3 材质驱动：class 发光 ---- */
   glowDuration: signal(0.05),     // 信号长度（秒）默认值：满亮保持 0.05s，再经同样时长衰减；0 = 持续
   glowPeak: signal(50),           // 峰值发光强度默认值
-  glowColor: signal('#ffffff'),   // 发光颜色
+  glowColor: signal('#ffa024'),   // 发光颜色
   glowActive: signal([]),         // [{ id, level }] 当前发光的 class
   glowInput: signal('0'),         // 测试窗口里手动输入的 class 编号（整数字符串）
   filter: signal(''),
+  statsCollapsed: signal(false),
   partsCollapsed: signal(false),
   selected: signal(-1),
   rev: signal(0),                 // parts 内容/显隐变化时自增

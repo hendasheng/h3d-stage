@@ -23,7 +23,7 @@ body {
 }
 #view { position: fixed; inset: 0; display: block; }
 
-/* ---------- 两栏浮层：左（标题 + 列表） / 右（控制） ---------- */
+/* ---------- 两栏浮层：左（标题 + 信息 + 列表） / 右（控制） ---------- */
 #mount {
   position: fixed; inset: 14px;
   display: flex; gap: 12px; align-items: flex-start;
@@ -35,9 +35,11 @@ body {
   max-height: 100%; min-height: 0;
   pointer-events: auto;
 }
-/* 两条对称的信息列：左边控制与模型信息，右边部件列表 */
-#left { width: 344px; }
-#right { width: 344px; margin-left: auto; overflow-y: auto; min-height: 0; }
+/* 左列放模型信息与部件列表；右列只保留控制。 */
+#left { width: 344px; height: 100%; overflow: hidden; }
+#right {
+  width: 344px; height: 100%; margin-left: auto; overflow: hidden;
+}
 
 .panel {
   background: var(--panel);
@@ -48,8 +50,13 @@ body {
 }
 #stats { padding: 12px; }
 
-/* Tweakpane 容器：去掉它自带的外层留白，与面板视觉统一 */
-.tp-wrap { border-radius: 10px; overflow: hidden; }
+/* 控制列独立滚动，展开内嵌选色器时不会截断内容。 */
+.tp-wrap {
+  flex: 1 1 0; min-height: 0; overflow-x: hidden; overflow-y: auto;
+  border-radius: 10px;
+}
+.tp-wrap::-webkit-scrollbar { width: 9px; }
+.tp-wrap::-webkit-scrollbar-thumb { background: #2c3542; border-radius: 5px; }
 
 /* ---------- 通用小元素 ---------- */
 h3 {

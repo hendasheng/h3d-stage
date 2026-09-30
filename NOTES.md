@@ -106,8 +106,7 @@ part.position.copy(base).addScaledVector(dir, factor * 0.7 * base.distanceTo(cen
 - 强度按**时间戳**计算，不按帧累加 → 掉帧不残留、不同帧率结果一致
 - 材质侧**把"颜色 × 强度"整体写进 `emissive`，`emissiveIntensity` 固定为 1**，基色不动
   → 颜色全黑时它就是纯基础材质；所以"基础材质 / 基础+发光"两态用**同一材质**表达，不需要换材质
-- **为什么不是"归一化颜色 + 大 emissiveIntensity"**：那样 R/G 通道会一起溢出到顶，
-  经 tone mapping 后**全变白**，只有衰减到低强度才显出颜色（踩过，见下）
+- 上述存储形式与使用 `emissiveIntensity` 数学等价，不会自行避免过曝；保色机制见「高强度发光与色调映射」。
 - **emissive 归发光独占**：选中高亮原先也写 emissive，会互相覆盖，已改为选中只在列表/信息区体现
 
 ## 测试与构建的坑
@@ -145,12 +144,19 @@ dev 却按 esbuild 默认的 `React.createElement` 编译 → 浏览器白屏 `R
 **Tweakpane 的 `setHex()` 吃不了 CSS 颜色字符串。** 面板的颜色值形如 `"#ff8800"`，
 `emissive.setHex("#ff8800")` 会得到 `#000NaN`（实测过）。统一改用 `new THREE.Color(v)` 解析。
 
-**发光一定不能写成"归一化颜色 + 大 emissiveIntensity"。** 曾用
-`emissive = #ff8800`（归一化）+ `emissiveIntensity = 2.5`，线性空间实际是 `(2.5, 0.616, 0)`：
-屏幕输出只有 0~1，R 早早溢出到顶、G 在强度约 4 时才追上，中间区间两通道一起顶格
-→ 经 ACES tone mapping 后**通体变白**，只有衰减到低强度时才显出设置的颜色。
-正解：`emissive = color × intensity`、`emissiveIntensity = 1` —— 数学上等价，但**色相比例在任何强度下恒定**。
-另注意 three 默认开启颜色管理，材质里存的是**线性空间**值（`#ff8800` 的 G ≈ 0.246 而非 0.533）。
+## 高强度发光与色调映射
+
+`emissive = color × intensity` 与 `emissive = color, emissiveIntensity = intensity`
+进入 Three shader 后完全等价。只验证材质通道比例，无法证明屏幕颜色正确。
+ACES 在高强度下会使颜色趋向白色；把乘法挪到 CPU 无法解决。
+
+将发光在 tone mapping 后压缩并混入基础颜色，会变成表面染色，不能替代发光。
+全场景 Bloom 会同时提取普通材质的高亮反射，不能保证只让指定 class 发光。
+当前使用原生 `MeshStandardMaterial` 自发光；场景辉光使用 Three 的 `UnrealBloomPass`，最后由 `OutputPass` 统一处理色调映射与输出颜色空间。关闭辉光时恢复直接渲染，没有自定义材质 shader。
+高强度褪色问题未解决，后续方案须验证指定 class 与未触发部件的实际显示。
+
+Three 默认颜色管理启用，材质存储的是线性值（`#ff8800` 的 G ≈ 0.246）。
+材质数值测试只能验证传值与归零，过曝程度仍需浏览器画面确认。
 
 ## 环境
 
