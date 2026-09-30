@@ -111,9 +111,11 @@ try {
     const others = await colorOf(0);
     ok('未触发的 class 0 仍为黑', lum(others) === 0, JSON.stringify(others));
 
-    // 颜色：默认白色应是等值三通道；换成橙色后应保持"R > G > B"的色相（而不是被拉平成白）
-    const white = peak;
-    ok('默认白色：三通道等值', Math.abs(white.r - white.g) < 1e-6 && Math.abs(white.g - white.b) < 1e-6, JSON.stringify(white));
+    // 默认色为 #ffa024；峰值受 tone mapping 限制，但必须仍保留橙色的 R > G > B 色相。
+    const defaultOrange = peak;
+    ok('默认橙色保留 R > G > B 色相',
+      defaultOrange.r > defaultOrange.g && defaultOrange.g > defaultOrange.b,
+      `r=${defaultOrange.r.toFixed(3)} g=${defaultOrange.g.toFixed(3)} b=${defaultOrange.b.toFixed(3)}`);
 
     await evaluate(`window.__h3d.setGlowColor('#ff8800')`);
     // 显式给足够长的长度，避免依赖默认值（默认 0.05s，衰减太快读不到）

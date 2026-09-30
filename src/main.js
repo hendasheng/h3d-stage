@@ -10,11 +10,13 @@ import * as THREE from 'three';
 import { render, h } from 'preact';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createEnvironmentLighting } from './environment.js';
+import { createFogBackdrop, createFogBackground, createFogGround, createVerticalFog } from './fog.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { configureKeyShadow, setSelfShadows, setShadowSoftness } from './shadows.js';
 import { App } from './ui/App.jsx';
 import { store, setInfo, setDebug, setSelection, touch } from './ui/store.js';
@@ -44,12 +46,14 @@ const GRID_SIZE = 40;       // 世界网格边长（同时作为格数 → 每�
 let renderer, scene, camera, controls, modelRoot, centerGroup, raycaster, worldGrid;
 let keyLight;
 let environmentLighting;
-let composer, bloomPass;
+let composer, bloomPass, gtaoPass;
+let verticalFog, fogBackdrop, fogBackground, fogGround;
 const auxiliaryLights = [];
 let source = null;          // parseGLBBuffers 的结果
 let sourceMesh = null;      // three.js 侧的基准 Mesh
 let sourceScene = null;     // 加载出来的 gltf.scene
 let modelRadius = 10;
+let modelFloorY = -10;
 let classKey = '_class';    // 几何体上的分组属性名
 let classValueCount = 0;    // 该属性有多少种取值 = 有多少个碎块
 let classMaterials = new Map();   // class 编号 → 该 class 的材质列表（发光用）
@@ -113,6 +117,8 @@ async function loadModel(file) {
   const center = box.getCenter(new THREE.Vector3());
   modelRadius = Math.max(size.length() * 0.5, 1);
   sourceScene.position.sub(center);
+  modelFloorY = box.min.y - center.y;
+  fogGround.position.y = modelFloorY;
   configureKeyShadow(keyLight, modelRadius);
 
   modelRoot = new THREE.Group();
@@ -264,6 +270,16 @@ function initThree() {
 
   camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.05, 4000);
   camera.position.set(14, 9, 16);
+  fogBackground = createFogBackground({ height: store.fogHeight.value, smoothness: store.fogSmoothness.value });
+  scene.add(fogBackground.mesh);
+  fogBackdrop = createFogBackdrop({
+    enabled: store.fogEnabled.value,
+    height: store.fogHeight.value,
+    smoothness: store.fogSmoothness.value,
+  }, camera);
+  scene.add(fogBackdrop.mesh);
+  fogGround = createFogGround();
+  scene.add(fogGround);
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
@@ -295,6 +311,11 @@ function initThree() {
   // 标准场景后期：先在 HDR 中生成辉光，最后统一做色调映射与颜色空间转换。
   composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
+  gtaoPass = new GTAOPass(scene, camera, innerWidth, innerHeight);
+  gtaoPass.blendIntensity = store.gtaoIntensity.value;
+  gtaoPass.updateGtaoMaterial({ radius: store.gtaoRadius.value, thickness: 1 });
+  gtaoPass.enabled = store.gtaoEnabled.value;
+  composer.addPass(gtaoPass);
   bloomPass = new UnrealBloomPass(
     new THREE.Vector2(innerWidth, innerHeight),
     store.bloomStrength.value, store.bloomRadius.value, store.bloomThreshold.value,
@@ -307,6 +328,7 @@ function initThree() {
     camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
     composer.setSize(innerWidth, innerHeight);
+    gtaoPass.setSize(innerWidth, innerHeight);
   });
   renderer.domElement.addEventListener('pointerdown', onPointerDown);
   renderer.domElement.addEventListener('pointermove', onPointerMove);
@@ -327,6 +349,7 @@ function tick() {
 
   // 材质驱动：每帧按时间戳算各 class 的发光强度（与帧率无关），并写进材质
   if (glowActiveCount()) updateGlow();
+  fogBackdrop?.tick(performance.now() / 1000);
 
   if (needRender) {
     if (store.bloomEnabled.value) composer.render();
@@ -457,6 +480,28 @@ function initControlsWiring() {
     for (const [light, base] of auxiliaryLights) light.intensity = base * value;
   });
   store.shadowSoftness.subscribe((value) => { setShadowSoftness(keyLight, value); });
+  store.gtaoEnabled.subscribe((value) => { gtaoPass.enabled = value; });
+  store.gtaoIntensity.subscribe((value) => { gtaoPass.blendIntensity = value; });
+  store.gtaoRadius.subscribe((value) => { gtaoPass.updateGtaoMaterial({ radius: value }); });
+  const updateFog = () => verticalFog?.update({
+    enabled: store.fogEnabled.value,
+    height: store.fogHeight.value,
+    smoothness: store.fogSmoothness.value,
+    depth: store.fogDepth.value,
+    depthSmoothness: store.fogDepthSmoothness.value,
+  });
+  const updateFogBackdrop = () => fogBackdrop?.update({
+    enabled: store.fogEnabled.value,
+    height: store.fogHeight.value,
+    smoothness: store.fogSmoothness.value,
+  });
+  const updateFogBackground = () => fogBackground?.update({ height: store.fogHeight.value, smoothness: store.fogSmoothness.value });
+  const updateAllFog = () => { updateFog(); updateFogBackdrop(); updateFogBackground(); };
+  store.fogEnabled.subscribe(updateAllFog);
+  store.fogHeight.subscribe(updateAllFog);
+  store.fogSmoothness.subscribe(updateAllFog);
+  store.fogDepth.subscribe(updateAllFog);
+  store.fogDepthSmoothness.subscribe(updateAllFog);
   // subscribe 的回调会立即同步执行一次；模型没加载完之前不要真的重建
   store.model.subscribe((file) => {
     if (file && file !== store.info.value.model) void loadModel(file);
@@ -487,6 +532,7 @@ function initControlsWiring() {
 /* ================================================================== */
 
 function clearParts() {
+  verticalFog = null;
   for (const p of store.parts) {
     p.object.parent?.remove(p.object);
     if (p.source !== 'node') {
@@ -527,6 +573,14 @@ async function buildParts() {
 
   applyColors();
   setWireframe(store.parts, store.wireframe.value);
+  verticalFog = createVerticalFog({
+    enabled: store.fogEnabled.value,
+    height: store.fogHeight.value,
+    smoothness: store.fogSmoothness.value,
+    depth: store.fogDepth.value,
+    depthSmoothness: store.fogDepthSmoothness.value,
+  });
+  verticalFog.attach(store.parts);
   classMaterials = buildClassMaterialIndex(store.parts);   // class → 材质，发光时按编号直取
   glow.clearAll();
   store.glowActive.value = [];

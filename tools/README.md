@@ -9,6 +9,7 @@
 | `test-explode-reset.mjs` | 炸开滑块**归零复位**专项测试（直接导入真实的 `src/main.js`） | `npm run test:explode` |
 | `smoke-dev.mjs` | dev 模块转换检查：抓"页面根本打不开"（React 残留、裸包名 import、依赖未预构建） | `npm run test:smoke` |
 | `test-environment.mjs` | HDR 解析、环境切换、失败回退、异步竞态与资源释放（GPU 预过滤用桩） | `npm run test:environment` |
+| `test-fog.mjs` | 指定示例雾的材质注入、背景球、相机球与圆形地面 | `npm run test:fog` |
 | `test-shadows.mjs` | 主光阴影范围与每个 class 的投射 / 接收标记 | `npm run test:shadows` |
 | `verify-hdr-presets.mjs` | 按需联网检查官方 HDR 资源 HTTP、跨域许可与实际解析 | `node tools/verify-hdr-presets.mjs` |
 | `serve-dist.mjs` | 极简静态服务器，预览 `dist/`（不依赖 esbuild，可在受限环境跑） | `npm run serve` |

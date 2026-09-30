@@ -30,6 +30,14 @@ function TweakpaneControls() {
       bloomStrength: store.bloomStrength.value,
       bloomRadius: store.bloomRadius.value,
       bloomThreshold: store.bloomThreshold.value,
+      gtaoEnabled: store.gtaoEnabled.value,
+      gtaoIntensity: store.gtaoIntensity.value,
+      gtaoRadius: store.gtaoRadius.value,
+      fogEnabled: store.fogEnabled.value,
+      fogHeight: store.fogHeight.value,
+      fogSmoothness: store.fogSmoothness.value,
+      fogDepth: store.fogDepth.value,
+      fogDepthSmoothness: store.fogDepthSmoothness.value,
       environment: store.environment.value,
       environmentIntensity: store.environmentIntensity.value,
       lightIntensity: store.lightIntensity.value,
@@ -84,6 +92,26 @@ function TweakpaneControls() {
       .on('change', (ev) => { store.bloomRadius.value = ev.value; });
     fBloom.addBinding(params, 'bloomThreshold', { label: '亮度阈值', min: 0, max: 10, step: 0.01 })
       .on('change', (ev) => { store.bloomThreshold.value = ev.value; });
+
+    const fGtao = fScene.addFolder({ title: '接触遮蔽', expanded: true });
+    fGtao.addBinding(params, 'gtaoEnabled', { label: '开启' })
+      .on('change', (ev) => { store.gtaoEnabled.value = ev.value; });
+    fGtao.addBinding(params, 'gtaoIntensity', { label: '强度', min: 0, max: 2, step: 0.01 })
+      .on('change', (ev) => { store.gtaoIntensity.value = ev.value; });
+    fGtao.addBinding(params, 'gtaoRadius', { label: '范围', min: 0.05, max: 2, step: 0.01 })
+      .on('change', (ev) => { store.gtaoRadius.value = ev.value; });
+
+    const fFog = fScene.addFolder({ title: '雾', expanded: true });
+    fFog.addBinding(params, 'fogEnabled', { label: '开启' })
+      .on('change', (ev) => { store.fogEnabled.value = ev.value; });
+    fFog.addBinding(params, 'fogHeight', { label: '覆盖高度', min: -12, max: 12, step: 0.1 })
+      .on('change', (ev) => { store.fogHeight.value = ev.value; });
+    fFog.addBinding(params, 'fogSmoothness', { label: '过渡范围', min: 0.1, max: 10, step: 0.1 })
+      .on('change', (ev) => { store.fogSmoothness.value = ev.value; });
+    fFog.addBinding(params, 'fogDepth', { label: '深度', min: 0, max: 50, step: 0.1 })
+      .on('change', (ev) => { store.fogDepth.value = ev.value; });
+    fFog.addBinding(params, 'fogDepthSmoothness', { label: '深度过渡', min: 0, max: 50, step: 0.1 })
+      .on('change', (ev) => { store.fogDepthSmoothness.value = ev.value; });
 
     const fPart = pane.addFolder({ title: '每个部件', expanded: true });
     fPart.addBinding(params, 'explode', { label: '炸开距离', min: 0, max: 2, step: 0.01 })
@@ -142,6 +170,14 @@ function TweakpaneControls() {
         params.bloomStrength = store.bloomStrength.value;
         params.bloomRadius = store.bloomRadius.value;
         params.bloomThreshold = store.bloomThreshold.value;
+        params.gtaoEnabled = store.gtaoEnabled.value;
+        params.gtaoIntensity = store.gtaoIntensity.value;
+        params.gtaoRadius = store.gtaoRadius.value;
+        params.fogEnabled = store.fogEnabled.value;
+        params.fogHeight = store.fogHeight.value;
+        params.fogSmoothness = store.fogSmoothness.value;
+        params.fogDepth = store.fogDepth.value;
+        params.fogDepthSmoothness = store.fogDepthSmoothness.value;
         params.environment = store.environment.value;
         params.environmentStatus = store.environmentStatus.value;
         params.environmentIntensity = store.environmentIntensity.value;
