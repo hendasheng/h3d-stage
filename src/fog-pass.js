@@ -27,13 +27,16 @@ import * as THREE from 'three';
  */
 
 /**
- * 给一个 ShaderPass 接上"每帧刷新相机矩阵"的能力。
+ * 给一个 ShaderPass 接上"每帧刷新相机矩阵（以及深度纹理）"的能力。
  *
  * @param {object} pass three 的 ShaderPass（uniforms 用 FOG_PASS_SHADER）
  * @param {THREE.Camera} camera
+ * @param {() => object} [getDepthTexture] 每帧取一次深度纹理。
+ *   必须用 getter 而不是值：`EffectComposer.setSize()`（窗口缩放）会**重建**它的两个
+ *   render target，旧的深度纹理随之作废，抱着旧引用会让雾读到一张死纹理。
  * @returns {{update: () => void}} 每帧调用 update()
  */
-export function bindFogPassCamera(pass, camera) {
+export function bindFogPassCamera(pass, camera, getDepthTexture) {
   const update = () => {
     if (!pass || !camera) return;
     pass.uniforms.uInvProjection.value.copy(camera.projectionMatrixInverse);
@@ -41,6 +44,10 @@ export function bindFogPassCamera(pass, camera) {
     pass.uniforms.uCameraWorld.value.copy(camera.matrixWorld);
     pass.uniforms.cameraNear.value = camera.near;
     pass.uniforms.cameraFar.value = camera.far;
+    if (getDepthTexture) {
+      const depth = getDepthTexture();
+      if (depth && pass.uniforms.tDepth.value !== depth) pass.uniforms.tDepth.value = depth;
+    }
   };
   update();
   return { update };
@@ -134,9 +141,16 @@ export const FOG_PASS_SHADER = {
       float viewZ = perspectiveDepthToViewZ(d, cameraNear, cameraFar);
       vec4 ndc = vec4(vUv * 2.0 - 1.0, 0.0, 1.0);
       vec4 viewPos = uInvProjection * ndc;
-      viewPos /= viewPos.w;
+      // 逆投影在 z=远平面处会退化（w 为 0），指数超大。夹住，别让后面算出 Inf/NaN。
+      viewPos /= (abs(viewPos.w) < 1e-6 ? (viewPos.w < 0.0 ? -1e-6 : 1e-6) : viewPos.w);
       viewPos.z = viewZ;
       vec3 world = (uCameraWorld * vec4(viewPos.xyz, 1.0)).xyz;
+      // 硬保护：世界坐标一旦非有限（深度纹理异常、矩阵未更新等），直接原样输出。
+      // 宁可不加雾，也绝不能把垃圾值混进画面 —— 那种情况看起来就是整屏爆闪。
+      if (!all(lessThan(abs(world), vec3(1e7)))) {
+        gl_FragColor = color;
+        return;
+      }
 
       // 动态：三维噪声扰动雾面高度
       vec3 np = world * fogNoiseScale + vec3(uFogTime * fogFlow.x, uFogTime * fogFlow.y, uFogTime * fogFlowZ);
@@ -149,6 +163,8 @@ export const FOG_PASS_SHADER = {
       float depthMixer = smoothstep(distanceToCamera + fogDepthSmoothness, distanceToCamera - fogDepthSmoothness, fogDepth);
       depthMixer = mix(0.0, depthMixer, verticalMixer);
       float mixer = clamp(verticalMixer * 0.5 + depthMixer * 0.95, 0.0, 1.0) * uFogEnabled;
+      // mixer 也必须有限，否则 mix 出来是 NaN
+      if (!(mixer >= 0.0)) mixer = 0.0;
 
       gl_FragColor = vec4(mix(color.rgb, uFogColor, mixer), color.a);
     }`,

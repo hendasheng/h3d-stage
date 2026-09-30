@@ -206,6 +206,17 @@ async function loadModel(file) {
       camera: () => camera,
       renderer: () => renderer,
       composer: () => composer,
+      fogPass: () => fogPass,
+      /** 调试：把雾 pass 的 tDepth 直接当颜色输出（判断深度纹理有没有数据） */
+      showDepth(enabled) {
+        if (!fogPass) return 'no pass';
+        if (!fogPass.userData.__origFrag) fogPass.userData.__origFrag = fogPass.material.fragmentShader;
+        fogPass.material.fragmentShader = enabled
+          ? 'uniform sampler2D tDepth;\nvarying vec2 vUv;\nvoid main(){ float d = texture2D(tDepth, vUv).x; gl_FragColor = vec4(d, d, d, 1.0); }'
+          : fogPass.userData.__origFrag;
+        fogPass.material.needsUpdate = true;
+        return enabled ? 'depth view on' : 'depth view off';
+      },
       fog,
       store,
       fogInfo: () => ({
@@ -330,18 +341,52 @@ function initThree() {
 
   // 标准场景后期：先在 HDR 中生成辉光，最后统一做色调映射与颜色空间转换。
   //
-  // 雾走**全屏后期**（不是材质注入）：它需要场景的深度来重建每个像素的世界坐标。
-  // 所以给 composer 的 render target 挂一张深度纹理 —— RenderPass 渲染时会把深度写进去，
-  // 雾 pass 读它。这是"雾能作用在整个画面上"的前提。
-  const fogDepthTexture = new THREE.DepthTexture(innerWidth, innerHeight);
-  fogDepthTexture.format = THREE.DepthFormat;
-  fogDepthTexture.type = THREE.UnsignedShortType;
+  // 雾走**全屏后期**（不是材质注入）：它需要场景深度来重建每个像素的世界坐标，
+  // 所以 composer 的 render target 挂一张深度纹理（RenderPass 写、雾 pass 读）。
+  //
+  // **顺序：雾紧跟 RenderPass，在 GTAO / 辉光之前。** 这不是审美选择，是正确性：
+  //   1. 刚渲染完那一刻深度一定是新鲜的 —— 与后面接多少个 pass 无关，
+  //      不会出现"某个 pass 顺手把深度缓冲清掉/换掉"这类难查的问题；
+  //   2. 雾是"空间里的介质"，本来就该作用在最原始的场景颜色上，
+  //      再让 GTAO（接触遮蔽）与辉光去处理雾化后的画面。
+  //
+  // **踩过并改坏过画面的坑**：`EffectComposer` 会把我传进去的 render target 变成它的
+  // renderTarget1 / renderTarget2 两个缓冲，而场景**只写进 renderTarget1 的深度**
+  // （RenderPass 写的是当时的 readBuffer，第一步就是 renderTarget1）。
+  // 第一版我照着 readBuffer 去绑，结果把一张**从未写过**的深度纹理交给雾：
+  // 未初始化的深度每帧内容不定 → 重建出的世界坐标是垃圾 → 雾量乱跳 → **整屏爆闪**。
   const composerTarget = new THREE.WebGLRenderTarget(innerWidth, innerHeight, {
     depthBuffer: true,
-    depthTexture: fogDepthTexture,
+    depthTexture: new THREE.DepthTexture(innerWidth, innerHeight),
   });
+  composerTarget.depthTexture.format = THREE.DepthFormat;
+  composerTarget.depthTexture.type = THREE.UnsignedShortType;
   composer = new EffectComposer(renderer, composerTarget);
   composer.addPass(new RenderPass(scene, camera));
+
+  fogPass = new ShaderPass(FOG_PASS_SHADER);
+  /**
+   * 取"场景深度"那张纹理。
+   * 用 getter 而不是固定值：`EffectComposer.setSize()`（窗口缩放）会**重建**这两个 target，
+   * 旧纹理随之作废，抱着旧引用会让雾读到一张死纹理。
+   */
+  const sceneDepthTexture = () => {
+    const rt = composer?.renderTarget1;
+    if (!rt) return null;
+    if (!rt.depthTexture) {
+      // 理论上不会发生（我们建 target 时就挂了），但真发生了要出声，不要静默出垃圾画面
+      rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height);
+      rt.depthTexture.format = THREE.DepthFormat;
+      rt.depthTexture.type = THREE.UnsignedShortType;
+      console.warn('[fog] renderTarget1 上没有深度纹理，已补一张');
+    }
+    return rt.depthTexture;
+  };
+  fogPass.uniforms.tDepth.value = sceneDepthTexture();
+  // 相机矩阵必须自己传（ShaderMaterial 拿不到 three 的内建矩阵），并且每帧刷新
+  fogCamera = bindFogPassCamera(fogPass, camera, sceneDepthTexture);
+  composer.addPass(fogPass);
+
   gtaoPass = new GTAOPass(scene, camera, innerWidth, innerHeight);
   gtaoPass.blendIntensity = store.gtaoIntensity.value;
   gtaoPass.updateGtaoMaterial({ radius: store.gtaoRadius.value, thickness: 1 });
@@ -352,12 +397,6 @@ function initThree() {
     store.bloomStrength.value, store.bloomRadius.value, store.bloomThreshold.value,
   );
   composer.addPass(bloomPass);
-  // 雾在辉光之后、色调映射之前：这样雾色与场景一同经过 OutputPass，颜色才一致
-  fogPass = new ShaderPass(FOG_PASS_SHADER);
-  fogPass.uniforms.tDepth.value = fogDepthTexture;
-  // 相机矩阵必须自己传（ShaderMaterial 拿不到 three 的内建矩阵），并且每帧刷新
-  fogCamera = bindFogPassCamera(fogPass, camera);
-  composer.addPass(fogPass);
   composer.addPass(new OutputPass());
 
   // 把 pass 交给雾管理器，并把噪声贴图与当前参数灌进去

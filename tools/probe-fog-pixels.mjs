@@ -186,9 +186,51 @@ try {
       const DIAG = [];
       const runCase = (label, s, time) => {
         const r = shoot(s, time);
-        OUT.push({ label, ...r, rgb: rgb(4, 24, 20, 40) });
+        OUT.push({ label, ...r, rgb: rgb(4, 24, 20, 39) });
         return r;
       };
+
+      // 先确认深度纹理里**真的有场景深度**：如果它是一张没被渲染过的纹理（初值是垃圾），
+      // 雾量就会逐帧乱跳 —— 用户看到的就是"整屏爆闪"。
+      // 做法：把深度直接当颜色输出，看背景（远）与板（近）是否明显不同。
+      const depthProbe = new ShaderPass({
+        uniforms: { tDepth: { value: depthTexture } },
+        vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+        fragmentShader: 'uniform sampler2D tDepth; varying vec2 vUv;'
+          + 'void main(){ float d = texture2D(tDepth, vUv).x; gl_FragColor = vec4(d, d, d, 1.0); }',
+      });
+      renderer.setRenderTarget(sceneRt);
+      renderer.render(scene, cam);
+      renderer.setRenderTarget(null);
+      depthProbe.render(renderer, outRt, sceneRt, 0, false);
+      renderer.readRenderTargetPixels(outRt, 0, 0, W, H, buf);
+      const dAt = (x, y) => buf[(y * W + x) * 4];
+      let dMin = 255, dMax = 0;
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+        const v = dAt(x, y);
+        if (v < dMin) dMin = v;
+        if (v > dMax) dMax = v;
+      }
+      DIAG.push('深度纹理：背景(远)=' + dAt(8, 32) + '，板(近)=' + dAt(50, 32)
+        + '，全图值域 ' + dMin + '..' + dMax
+        + (dMax - dMin > 5 ? ' → 有真实深度' : ' → 深度是常量（雾会乱跳）'));
+      DIAG.push('三种 depthTexture 的合法性：'
+        + 'sceneRt.depthTexture=' + (sceneRt.depthTexture ? 'yes' : 'no')
+        + ' outRt.depthTexture=' + (outRt.depthTexture ? 'yes' : 'no'));
+      {
+        // 用**当前真正被绑定的那张**深度再探一次（排除"我读错了 target"这种可能）
+        const t = pass.uniforms.tDepth.value;
+        DIAG.push('雾 pass 绑的 tDepth 是不是 depthTexture：' + (t === depthTexture));
+        const p2 = new ShaderPass({
+          uniforms: { tDepth: { value: t } },
+          vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+          fragmentShader: 'uniform sampler2D tDepth; varying vec2 vUv;'
+            + 'void main(){ float d = texture2D(tDepth, vUv).x; gl_FragColor = vec4(d, d, d, 1.0); }',
+        });
+        p2.render(renderer, outRt, sceneRt, 0, false);
+        renderer.readRenderTargetPixels(outRt, 0, 0, W, H, buf);
+        DIAG.push('  同一张深度再读：背景=' + buf[(32 * W + 8) * 4] + ' 板=' + buf[(32 * W + 50) * 4]);
+      }
 
       runCase('A 关雾', { ...BASE, enabled: false });
       runCase('B 开雾（基准）', BASE);

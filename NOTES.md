@@ -214,6 +214,24 @@ color = mix(color, fogColor, mixer);
 > 编译日志里没有错误（`renderer.info.programs[].diagnostics`），
 > 以及**像素真的变了**（`readPixels` 回读）。两者都做过才敢说修好了。
 
+### 深度纹理必须取自 `renderTarget1`，否则整屏爆闪（本版最惨的一次翻车）
+
+`EffectComposer` 会把传进去的 render target 变成它的 `renderTarget1` / `renderTarget2` 两个缓冲，
+而**场景的深度只写进 `renderTarget1`**（`RenderPass` 写的是当时的 readBuffer，第一步就是它）。
+
+第一版我"顺着 readBuffer 去绑深度"，结果把一张**从未被写过**的深度纹理交给雾 pass：
+未初始化的深度纹理每帧内容不定 → 重建出的世界坐标是垃圾 → 雾量乱跳 → **整屏爆闪**。
+
+两条结论：
+
+- 深度固定取 `composer.renderTarget1.depthTexture`；并且用 getter 每帧现取，
+  因为 `EffectComposer.setSize()`（窗口缩放）会**重建**这两个 target，旧纹理随之作废。
+- 雾 pass 放在 **紧跟 RenderPass、GTAO/辉光之前**。刚渲染完那一刻深度一定新鲜，
+  与后面接多少个 pass 无关；雾是"空间里的介质"，本来就该作用在最原始的场景颜色上。
+
+另外在片元里加了硬保护：世界坐标一旦非有限就**原样输出**（宁可不加雾，也绝不把垃圾混进画面），
+`viewPos.w` 接近 0 时也夹住。这类"输出垃圾"的失败模式看起来就是爆闪，代价太大，值得多一层保险。
+
 ### 从深度重建世界坐标：矩阵必须自己传
 
 ```glsl
